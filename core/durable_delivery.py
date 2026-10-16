@@ -2,9 +2,10 @@ import time
 
 from core.delivery_workflow import finalize_delivery
 from core.deduplicator import delivery_fingerprint
+from notify.adapters import DeliveryResult, LegacyNotifierAdapter
 
 
-def deliver(store, job, source_ids, telegram, email):
+def deliver(store, job, source_ids, telegram, email, adapters=None):
     fingerprint = delivery_fingerprint(job)
     store.enqueue(job)
     with store.connect() as db:
@@ -15,7 +16,14 @@ def deliver(store, job, source_ids, telegram, email):
         return False
     sent = False
     outcome = 'FAILED'
-    for channel, notifier in [('telegram', telegram), ('email', email)]:
+    adapters = adapters or [
+        LegacyNotifierAdapter(telegram, 'telegram'),
+        LegacyNotifierAdapter(email, 'email'),
+    ]
+    for adapter in adapters:
+        if getattr(adapter, 'configured', True) is False:
+            continue
+        channel = adapter.channel
         # Persist uncertainty BEFORE the external side effect.
         attempt_id = store.begin_delivery_attempt(
             fingerprint, source_ids, channel, store.state.get("active_cycle_id", "")
@@ -24,8 +32,9 @@ def deliver(store, job, source_ids, telegram, email):
             attempt = db.execute('INSERT INTO channel_attempts(fingerprint,channel,status,created) '
                                  "VALUES (?,?,'UNKNOWN',datetime('now'))", (fingerprint, channel)).lastrowid
         try:
-            sent = notifier.send_job_alert(job)
-            outcome = 'DELIVERED' if sent else getattr(notifier, 'last_status', 'UNKNOWN')
+            result = adapter.send_job_alert(job)
+            sent = result.status == 'DELIVERED'
+            outcome = result.status
         except Exception:
             outcome = 'UNKNOWN'
         with store.connect() as db:

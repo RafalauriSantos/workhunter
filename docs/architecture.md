@@ -16,7 +16,10 @@ flowchart LR
     G --> I[Decision audit]
     H --> I
     I --> J[SQLite and local state]
-    I --> K[Telegram notification]
+    I --> K[Notification adapters]
+    K --> K1[Telegram]
+    K --> K2[Email]
+    K --> K3[WhatsApp Cloud optional]
     J --> L[Health and heartbeat]
 ```
 
@@ -31,6 +34,9 @@ flowchart LR
   is available, the heuristic path keeps the cycle alive.
 - SQLite stores durable local decisions, manual cases and recovery information.
 - Telegram is a delivery channel, not the source of truth.
+- Delivery uses adapters so channels can be compared or changed without
+  changing collection, scoring or audit logic. WhatsApp remains disabled until
+  official credentials and an approved template are configured.
 - systemd keeps the local services running and restarts recoverable failures.
 
 ## Reliability model

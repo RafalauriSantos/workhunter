@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -22,6 +22,7 @@ from collectors.manual_collector import ManualCollector
 from collectors.geekhunter_collector import GeekHunterCollector
 from notify.telegram_notifier import TelegramNotifier
 from notify.email_notifier import ResendEmailNotifier
+from notify.adapters import LegacyNotifierAdapter, WPPConnectAdapter, WhatsAppCloudAdapter
 from storage.state_store import StateStore
 from core.query_planner import plan_searches, unique_searches, rotate_searches
 from core.delivery_workflow import finalize_delivery
@@ -49,6 +50,15 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_RECIPIENT = os.getenv("WHATSAPP_RECIPIENT")
+WHATSAPP_TEMPLATE_NAME = os.getenv("WHATSAPP_TEMPLATE_NAME")
+WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "pt_BR")
+WPPCONNECT_API_URL = os.getenv("WPPCONNECT_API_URL")
+WPPCONNECT_TOKEN = os.getenv("WPPCONNECT_TOKEN")
+WPPCONNECT_SESSION = os.getenv("WPPCONNECT_SESSION")
+WPPCONNECT_RECIPIENT = os.getenv("WPPCONNECT_RECIPIENT")
 
 
 def get_http_session() -> requests.Session:
@@ -65,7 +75,9 @@ def get_http_session() -> requests.Session:
         read=1,
         status=1,
         backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
+        # A 429 is an explicit provider cooldown signal. Retrying it here
+        # defeats the source-level circuit breaker and adds more pressure.
+        status_forcelist=[500, 502, 503, 504],
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retries)
@@ -75,6 +87,16 @@ def get_http_session() -> requests.Session:
 
 
 HTTP = get_http_session()
+
+
+def format_linkedin_query_stats(query):
+    """Format a LinkedIn query record without assuming a live search ran."""
+    return (
+        f"│  └─ busca='{query.get('keywords', '*')}' janela={query.get('time_range', 'n/a')} "
+        f"páginas={query.get('pages', 0)} cartões={query.get('cards', 0)} "
+        f"válidas={query.get('parsed_jobs', 0)} enriquecidas={query.get('enrichment_successes', 0)}/"
+        f"{query.get('enrichment_attempts', 0)} status={query.get('status', 'UNKNOWN')}"
+    )
 
 
 def load_config() -> dict:
@@ -153,13 +175,30 @@ def run_check():
     email_notifier = ResendEmailNotifier(
         RESEND_API_KEY, ALERT_EMAIL_FROM, ALERT_EMAIL_TO, HTTP
     )
+    whatsapp_adapter = WhatsAppCloudAdapter(
+        WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_RECIPIENT,
+        WHATSAPP_TEMPLATE_NAME, WHATSAPP_TEMPLATE_LANGUAGE, HTTP
+    )
+    wppconnect_adapter = WPPConnectAdapter(
+        WPPCONNECT_API_URL, WPPCONNECT_TOKEN, WPPCONNECT_SESSION,
+        WPPCONNECT_RECIPIENT, HTTP
+    )
+    notification_adapters = [
+        LegacyNotifierAdapter(notifier, 'telegram'),
+        LegacyNotifierAdapter(email_notifier, 'email'),
+        whatsapp_adapter,
+        wppconnect_adapter,
+    ]
     durable = hasattr(store, 'pending_jobs')
     recovered_deliveries = 0
     if durable:
         from core.durable_delivery import deliver
         for pending in store.pending_jobs():
             ids = [f'{name}:{item.source_job_id}' for name, item in pending.sources.items()]
-            recovered_deliveries += int(deliver(store, pending, ids, notifier, email_notifier))
+            recovered_deliveries += int(deliver(
+                store, pending, ids, notifier, email_notifier,
+                adapters=notification_adapters,
+            ))
     deduplicator = Deduplicator()
     min_score = config.get("min_match_score", 50)  # Padrão: 50 pts mínimos para alertar
     progression_min_score = config.get("progression_min_score", 35)
@@ -198,13 +237,12 @@ def run_check():
             for planned_query in plan_searches([m], "linkedin"):
                 search = dict(planned_query)
                 search["keywords"] = planned_query["query"]
-                search["max_pages"] = m.get("max_pages", 3)
-                # Keep automatic searches on the same public enrichment path as
-                # manual links, with a bounded per-query request budget.
-                search["enrich_details"] = m.get("enrich_details", True)
-                search["detail_enrichment_limit"] = int(
-                    m.get("detail_enrichment_limit", config.get("linkedin_detail_enrichment_limit", 8))
+                search["max_pages"] = min(
+                    int(m.get("max_pages", 3)),
+                    int(config.get("linkedin_max_pages_per_query", 1)),
                 )
+                search["enrich_details"] = bool(config.get("linkedin_detail_enrichment_enabled", False))
+                search["detail_enrichment_limit"] = 0
                 linkedin_searches.append(search)
         elif m_type == "rss":
             rss_configs.append(m)
@@ -285,32 +323,66 @@ def run_check():
         }} )
 
     if linkedin_searches and not manual_only:
-        try:
-            max_linkedin_queries = int(config.get("linkedin_max_queries", 8))
-            linkedin_searches = rotate_searches(
-                unique_searches(linkedin_searches), max_linkedin_queries,
-                # Rotate on the configured collection cadence. Using a fixed
-                # hourly slot would run the same query batch twice when the
-                # monitor is configured for 30-minute cycles.
-                slot=int(time.time() // (max(1, int(config.get("check_interval_minutes", 60))) * 60)),
-            )
-            li_col = LinkedInCollector(HTTP, linkedin_searches)
-            result = collect_result(li_col)
-            discovered_linkedin, linkedin_status = result.jobs, result.status
-            linkedin_query_stats = li_col.query_stats
-            for attempt in li_col.collection_attempts:
-                attempt['cycle_id'] = cycle_id
-                if durable:
-                    store.record_collection_attempt(attempt)
-            failed_queries = [
-                item.get("status", "UNKNOWN")
-                for item in linkedin_query_stats
-                if item.get("status") not in {"OK", "UNKNOWN"}
-            ]
-            if failed_queries and not discovered_linkedin:
-                linkedin_status = f"FALHA ({', '.join(failed_queries)})"
-        except Exception as e:
-            linkedin_status = f"FALHA ({e})"
+        cooldown = store.get_source_cooldown("linkedin")
+        if cooldown:
+            linkedin_status = "COOLDOWN"
+            linkedin_query_stats = [{
+                "keywords": "*",
+                "time_range": "cooldown",
+                "pages": 0,
+                "cards": 0,
+                "parsed_jobs": 0,
+                "enrichment_successes": 0,
+                "enrichment_attempts": 0,
+                "status": "COOLDOWN",
+                "reason": "HTTP_429",
+                "until": cooldown["until"],
+                "consecutive_failures": cooldown["consecutive_failures"],
+            }]
+            print(f"[LinkedInCollector] Em cooldown até {cooldown['until']}; busca suspensa após HTTP 429.")
+        else:
+            poll_interval = max(1, int(config.get("linkedin_poll_interval_hours", 6))) * 3600
+            last_poll = store.get_last_source_poll("linkedin")
+            if last_poll:
+                try:
+                    last_poll_at = datetime.fromisoformat(last_poll)
+                    if last_poll_at.tzinfo is None:
+                        last_poll_at = last_poll_at.replace(tzinfo=timezone.utc)
+                    elapsed = (datetime.now(timezone.utc) - last_poll_at).total_seconds()
+                except (TypeError, ValueError):
+                    elapsed = poll_interval
+                if elapsed < poll_interval:
+                    next_poll = last_poll_at + timedelta(seconds=poll_interval)
+                    linkedin_status = "THROTTLED"
+                    linkedin_query_stats = [{
+                        "keywords": "*", "status": "THROTTLED", "pages": 0,
+                        "reason": "SOURCE_POLL_INTERVAL",
+                        "next_check_at": next_poll.isoformat(),
+                    }]
+                    print(f"[LinkedInCollector] Consulta adiada até {next_poll.isoformat()} para reduzir rate limit.")
+            if linkedin_status != "THROTTLED":
+                try:
+                    max_linkedin_queries = int(config.get("linkedin_max_queries", 8))
+                    linkedin_searches = rotate_searches(
+                        unique_searches(linkedin_searches), max_linkedin_queries,
+                        slot=int(time.time() // (max(1, int(config.get("check_interval_minutes", 60))) * 60)),
+                    )
+                    li_col = LinkedInCollector(HTTP, linkedin_searches)
+                    result = collect_result(li_col)
+                    discovered_linkedin, linkedin_status = result.jobs, result.status
+                    linkedin_query_stats = li_col.query_stats
+                    for attempt in getattr(li_col, "collection_attempts", []):
+                        attempt['cycle_id'] = cycle_id
+                        if durable:
+                            store.record_collection_attempt(attempt)
+                    if li_col.rate_limited:
+                        cooldown = store.register_source_rate_limit("linkedin")
+                        linkedin_status = "PARTIAL"
+                        print(f"[LinkedInCollector] Cooldown persistente de {cooldown['cooldown_seconds']}s registrado.")
+                    elif linkedin_status == "OK":
+                        store.clear_source_cooldown("linkedin")
+                except Exception as e:
+                    linkedin_status = f"FALHA ({e})"
         write_cycle_progress(cycle_id, 'linkedin', {'linkedin': {
             'status': linkedin_status, 'discovered': len(discovered_linkedin)
         }} )
@@ -609,7 +681,10 @@ def run_check():
     ):
         fp = delivery_fingerprint(job)
         if durable:
-            notified_count += int(deliver(store, job, source_ids, notifier, email_notifier))
+            notified_count += int(deliver(
+                store, job, source_ids, notifier, email_notifier,
+                adapters=notification_adapters,
+            ))
             continue
         if not store.claim_delivery(fp):
             discarded_seen += 1
@@ -653,12 +728,7 @@ def run_check():
         )
     print(f"├─ LinkedIn: {linkedin_status:<8} | {len(discovered_linkedin)} vaga(s)")
     for query in linkedin_query_stats:
-        print(
-            f"│  └─ busca='{query['keywords']}' janela={query['time_range']} "
-                f"páginas={query['pages']} cartões={query['cards']} "
-            f"válidas={query['parsed_jobs']} enriquecidas={query.get('enrichment_successes', 0)}/"
-            f"{query.get('enrichment_attempts', 0)} status={query['status']}"
-        )
+        print(format_linkedin_query_stats(query))
     print(f"├─ RSS:      {rss_status:<8} | {len(discovered_rss)} vaga(s)")
     print(f"├─ GitHub:   {github_status:<8} | {len(discovered_github)} vaga(s)")
     print("├" + "─" * 46)
