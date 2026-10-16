@@ -116,6 +116,32 @@ def test_linkedin_collector_defers_remaining_searches_after_rate_limit(monkeypat
     assert collector.query_stats[0]["status"] == "HTTP_429"
 
 
+def test_detail_rate_limit_stops_additional_linkedin_requests(monkeypatch):
+    session = requests.Session()
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if "seeMoreJobPostings" in url:
+            return MockResponse(SAMPLE_LINKEDIN_HTML, 200)
+        return MockResponse("", 429)
+
+    monkeypatch.setattr(session, "get", fake_get)
+    collector = LinkedInCollector(session, [{
+        "keywords": "desenvolvedor",
+        "max_pages": 1,
+        "enrich_details": True,
+        "detail_enrichment_limit": 8,
+    }])
+
+    jobs = collector.collect()
+
+    assert len(jobs) == 2
+    assert len(calls) == 2
+    assert collector.rate_limited is True
+    assert collector.query_stats[0]["enrichment_attempts"] == 1
+
+
 def test_linkedin_collector_handles_malformed_html(monkeypatch):
     session = requests.Session()
     # HTML corrompido ou inesperado

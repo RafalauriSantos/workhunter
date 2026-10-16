@@ -174,6 +174,33 @@ def test_run_check_preserves_distinct_linkedin_query_variants(monkeypatch, tmp_p
     assert [query["query"] for query in captured["searches"]] == ["React Junior", "React Pleno", "Frontend React"]
 
 
+def test_run_check_skips_linkedin_during_persisted_rate_limit(monkeypatch, tmp_path):
+    state_file = tmp_path / "seen.json"
+    captured = {"collector": 0}
+    config = {
+        "min_match_score": 50,
+        "heartbeat": {"enabled": False},
+        "monitors": [{"type": "linkedin", "keywords_search": "React"}],
+    }
+
+    class UnexpectedLinkedIn(EmptyCollector):
+        def __init__(self, *args, **kwargs):
+            captured["collector"] += 1
+            super().__init__(*args, **kwargs)
+
+    store = StateStore(str(state_file))
+    store.register_source_rate_limit("linkedin")
+
+    monkeypatch.setattr(monitor, "load_config", lambda: config)
+    monkeypatch.setattr(monitor, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(monitor, "LinkedInCollector", UnexpectedLinkedIn)
+    monkeypatch.setattr(monitor, "TelegramNotifier", lambda *args, **kwargs: FakeNotifier())
+
+    monitor.run_check()
+
+    assert captured["collector"] == 0
+
+
 def test_run_check_never_sends_scope_with_hard_barrier_even_if_score_is_high(monkeypatch, tmp_path):
     state_file = tmp_path / "seen.json"
     config = {"min_match_score": 1, "heartbeat": {"enabled": False}, "monitors": [{"type": "gupy", "term": "Java"}]}

@@ -24,6 +24,8 @@ class LinkedInCollector(BaseCollector):
             started = datetime.now(timezone.utc).isoformat()
             response = self.http.get(job.sources["linkedin"].url, headers=headers, timeout=6)
             if response.status_code != 200:
+                if response.status_code == 429:
+                    self.rate_limited = True
                 self.record_attempt('linkedin', 'detail', started, query={'job_id': job.sources['linkedin'].source_job_id},
                                     http_status=response.status_code, error_type=f'HTTP_{response.status_code}')
                 return False
@@ -197,6 +199,8 @@ class LinkedInCollector(BaseCollector):
                     jobs, key=self._enrichment_priority, reverse=True
                 )[:enrichment_limit]
                 for job in enrichment_candidates:
+                    if self.rate_limited:
+                        break
                     stats["enrichment_attempts"] += 1
                     if self._enrich_job(job, headers):
                         stats["enrichment_successes"] += 1

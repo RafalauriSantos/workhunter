@@ -52,6 +52,51 @@ def test_poll_details_distinguish_command_from_url(tmp_path):
     assert result == {'handled': 1, 'urls_registered': 0}
 
 
+def test_poll_details_returns_consistent_empty_result_for_http_error(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+
+    class Response:
+        status_code = 502
+
+    class Http:
+        def get(self, url, **kwargs):
+            return Response()
+
+    assert poll_manual_urls(store, Http(), 'token', '42', return_details=True) == {
+        'handled': 0, 'urls_registered': 0,
+    }
+
+
+def test_generic_linkedin_page_is_not_queued(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    sent = []
+
+    class Response:
+        status_code = 200
+        url = 'https://www.linkedin.com/feed/'
+
+        def json(self):
+            return {'result': [{'update_id': 5, 'message': {
+                'chat': {'id': '42'}, 'from': {'id': '99'},
+                'text': 'https://www.linkedin.com/feed/',
+            }}]}
+
+    class Http:
+        def get(self, *args, **kwargs):
+            return Response()
+
+        def post(self, *args, **kwargs):
+            sent.append(args)
+            return Response()
+
+    assert poll_manual_urls(store, Http(), 'token', '42', '99', return_details=True) == {
+        'handled': 0, 'urls_registered': 0,
+    }
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM manual_cases').fetchone()[0] == 0
+    assert not sent
+
+
 def test_plain_start_is_replied_to_without_entering_manual_queue(tmp_path):
     store = SQLiteStore(tmp_path / 'state.db')
     sent = []
@@ -113,6 +158,14 @@ def test_linkedin_safety_wrapper_uses_nested_share_url():
             return Response()
     wrapped = 'https://www.linkedin.com/safety/go/?url=https%3A%2F%2Flnkd.in%2Fexample'
     assert resolve_linkedin_share(wrapped, Http()) == Response.url
+
+
+def test_linkedin_short_url_failure_is_not_enqueued():
+    class Http:
+        def get(self, *args, **kwargs):
+            raise TimeoutError('redirect lookup timed out')
+
+    assert resolve_linkedin_share('https://lnkd.in/example', Http()) == ''
 
 
 def test_linkedin_resolver_rejects_non_linkedin_destination():

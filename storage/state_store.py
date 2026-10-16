@@ -31,6 +31,7 @@ class StateStore:
                         "recent_decisions": data.get("recent_decisions", []),
                         "deliveries": data.get("deliveries", {}),
                         "source_health": data.get("source_health", []),
+                        "source_cooldowns": data.get("source_cooldowns", {}),
                         "delivery_claims": data.get("delivery_claims", {}),
                         "feedback": data.get("feedback", []),
                         "delivery_audit": data.get("delivery_audit", []),
@@ -178,6 +179,57 @@ class StateStore:
             "details": details or {},
         })
         self.state["source_health"] = history[-200:]
+
+    def get_last_source_poll(self, source: str):
+        """Return the last recorded cycle that actually attempted a source."""
+        skipped = {'THROTTLED', 'COOLDOWN', 'NOT_CONFIGURED'}
+        for item in reversed(self.state.get("source_health", [])):
+            if item.get("source") == source and item.get("status") not in skipped:
+                return item.get("timestamp")
+        return None
+
+    def get_source_cooldown(self, source: str, now=None):
+        """Return an active source cooldown, if one exists."""
+        import datetime
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        cooldown = self.state.get("source_cooldowns", {}).get(source)
+        if not cooldown:
+            return None
+        try:
+            until = datetime.datetime.fromisoformat(cooldown["until"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if until <= now:
+            return None
+        return cooldown
+
+    def register_source_rate_limit(self, source: str, now=None, base_seconds: int = 1800,
+                                   max_seconds: int = 21600):
+        """Persist an exponential cooldown after a source rate limit."""
+        import datetime
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        cooldowns = self.state.setdefault("source_cooldowns", {})
+        previous = cooldowns.get(source, {})
+        consecutive = int(previous.get("consecutive_failures", 0)) + 1
+        seconds = min(max_seconds, base_seconds * (2 ** (consecutive - 1)))
+        cooldown = {
+            "source": source,
+            "consecutive_failures": consecutive,
+            "cooldown_seconds": seconds,
+            "started_at": now.isoformat(),
+            "until": (now + datetime.timedelta(seconds=seconds)).isoformat(),
+            "reason": "HTTP_429",
+        }
+        cooldowns[source] = cooldown
+        self.save()
+        return cooldown
+
+    def clear_source_cooldown(self, source: str):
+        """Clear a source cooldown after a successful recovery."""
+        cooldowns = self.state.setdefault("source_cooldowns", {})
+        if source in cooldowns:
+            cooldowns.pop(source, None)
+            self.save()
 
     def delivery_retry_allowed(
         self, fingerprint: str, max_attempts: int = 3, ignore_backoff: bool = False
@@ -328,4 +380,3 @@ class StateStore:
         self.prune()
         with open(self.filepath, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2, ensure_ascii=False)
-

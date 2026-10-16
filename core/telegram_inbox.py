@@ -1,9 +1,12 @@
 """Minimal inbound Telegram adapter for manual job URLs."""
 import json
+import hmac
 import logging
+import os
 import re
 import time
 import unicodedata
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 URL_RE = re.compile(r'https?://[^\s<>]+', re.IGNORECASE)
@@ -15,6 +18,55 @@ TRUSTED_JOB_HOSTS = {
     'gupy.io', 'greenhouse.io', 'lever.co', 'trampos.co',
 }
 logger = logging.getLogger(__name__)
+
+
+def _enroll_promotion_recipient(message, http, token):
+    """Consume a one-time private deep link to register the grocery-alert chat.
+
+    This runs before WorkHunter's existing single-chat authorization filter so
+    a separately authorized recipient can connect without sharing numeric IDs.
+    The random capability is local, one-time, expires after seven days, and is
+    never written to logs or returned in responses.
+    """
+    text = (message.get('text') or '').strip().split()
+    if len(text) != 2 or text[0].split('@', 1)[0] != '/start':
+        return False
+    payload = text[1]
+    if not payload.startswith('promo_'):
+        return False
+    chat = message.get('chat', {})
+    if chat.get('type') != 'private' or not chat.get('id'):
+        return False
+
+    config_dir = Path.home() / '.config' / 'lista-compras-alertas'
+    invitation_file = config_dir / 'recipient-invitation.json'
+    config_file = config_dir / 'secrets.env'
+    try:
+        invitation = json.loads(invitation_file.read_text(encoding='utf-8'))
+        code = invitation.get('code', '')
+        created_at = float(invitation.get('created_at', 0))
+        if not code or time.time() - created_at > 7 * 86400 or not hmac.compare_digest(payload, code):
+            return False
+
+        chat_id = str(chat['id'])
+        previous = config_file.read_text(encoding='utf-8') if config_file.exists() else ''
+        lines = [line for line in previous.splitlines()
+                 if not line.strip().startswith('PROMOTIONS_TELEGRAM_CHAT_ID=')]
+        lines.append(f'PROMOTIONS_TELEGRAM_CHAT_ID={chat_id}')
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = config_file.with_suffix('.env.tmp')
+        temporary.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8')
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, config_file)
+        invitation_file.unlink()
+    except (OSError, ValueError, TypeError):
+        logger.warning('Promotion recipient enrollment could not be saved')
+        return False
+
+    _send_command_response(http=http, token=token, chat_id=chat_id,
+                           text='✅ Telegram conectado. Você receberá aqui o resumo diário de ofertas pela manhã.')
+    logger.info('A grocery-promotion recipient connected through a one-time invite')
+    return True
 
 
 def _send_command_response(http, token, chat_id, text):
@@ -66,14 +118,35 @@ def resolve_linkedin_share(url, http):
     candidate = unquote(nested[0]) if nested else url
     if not (_safe_linkedin_url(url) and _safe_linkedin_url(candidate)):
         return url
+    candidate_parts = urlparse(candidate)
+    if candidate_parts.hostname and candidate_parts.hostname.lower().rstrip('.') == 'lnkd.in':
+        try:
+            response = http.get(candidate, allow_redirects=True, timeout=10,
+                                headers={'User-Agent': 'Mozilla/5.0'})
+            resolved = getattr(response, 'url', '') or ''
+            if _safe_linkedin_url(resolved) or _safe_job_destination(resolved):
+                return resolved
+            return ''
+        except Exception:
+            return ''
     try:
         response = http.get(candidate, allow_redirects=True, timeout=10,
                             headers={'User-Agent': 'Mozilla/5.0'})
         resolved = getattr(response, 'url', '') or candidate
-        return resolved if (_safe_linkedin_url(resolved) or
-                            _safe_job_destination(resolved)) else ''
+        if not (_safe_linkedin_url(resolved) or _safe_job_destination(resolved)):
+            return ''
+        return resolved
     except Exception:
         return candidate
+
+
+def _is_generic_linkedin_page(url):
+    parsed = urlparse(url or '')
+    host = (parsed.hostname or '').lower().rstrip('.')
+    path = parsed.path.rstrip('/').lower() or '/'
+    return (host == 'linkedin.com' or host.endswith('.linkedin.com')) and path in {
+        '/', '/feed', '/notifications', '/mynetwork', '/messaging', '/jobs',
+    }
 
 
 def poll_manual_urls(store, http, token, chat_id, allowed_user_id=None,
@@ -84,8 +157,9 @@ def poll_manual_urls(store, http, token, chat_id, allowed_user_id=None,
     connection open until a message arrives or the server-side wait expires,
     avoiding a tight loop when the inbox is quiet.
     """
+    empty_result = {'handled': 0, 'urls_registered': 0} if return_details else 0
     if not token or not chat_id or http is None:
-        return 0
+        return empty_result
     with store.connect() as db:
         row = db.execute("SELECT value FROM metadata WHERE key='telegram_update_offset'").fetchone()
         offset = int(row[0]) if row else 0
@@ -94,7 +168,8 @@ def poll_manual_urls(store, http, token, chat_id, allowed_user_id=None,
                                 'allowed_updates': '["message"]'},
                         timeout=request_timeout)
     if response.status_code != 200:
-        return 0
+        logger.warning('Telegram update polling failed with HTTP %s', response.status_code)
+        return empty_result
     updates = response.json().get('result', [])
     registered = 0
     urls_registered = 0
@@ -102,6 +177,9 @@ def poll_manual_urls(store, http, token, chat_id, allowed_user_id=None,
     for update in updates:
         next_offset = max(next_offset, int(update.get('update_id', 0)) + 1)
         message = update.get('message', {})
+        if _enroll_promotion_recipient(message, http, token):
+            registered += 1
+            continue
         sender_chat = str(message.get('chat', {}).get('id', ''))
         if sender_chat != str(chat_id):
             continue
@@ -134,7 +212,7 @@ def poll_manual_urls(store, http, token, chat_id, allowed_user_id=None,
             continue
         for url in extract_job_urls(message_text):
             resolved_url = resolve_linkedin_share(url, http)
-            if not resolved_url:
+            if not resolved_url or _is_generic_linkedin_page(resolved_url):
                 continue
             queue_id = store.record_manual_case(resolved_url)
             registered += 1

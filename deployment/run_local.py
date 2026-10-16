@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import socket
 import subprocess
 import sys
 import time
@@ -13,6 +14,18 @@ from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+NETWORK_PROBE_HOSTS = ('candidates.mcp.api.gupy.io', 'api.telegram.org')
+
+
+def network_is_ready():
+    """Check DNS and outbound HTTPS reachability without making an API call."""
+    for host in NETWORK_PROBE_HOSTS:
+        try:
+            with socket.create_connection((host, 443), timeout=3):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def mark_watchdog_timeout(database, timeout_seconds):
@@ -119,6 +132,10 @@ def main():
             while True:
                 started = time.monotonic()
                 try:
+                    if not network_is_ready():
+                        logger.warning('Network/DNS is not ready; delaying collection cycle')
+                        time.sleep(30)
+                        continue
                     # Isolate each collection so a hung network call cannot freeze
                     # the watchdog permanently. The child owns the cycle lock.
                     command = [sys.executable, str(Path(__file__).resolve()), *arguments]
