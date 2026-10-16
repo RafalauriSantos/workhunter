@@ -32,8 +32,9 @@ def send_operational(http, message):
 
 def update_source_alerts(store, statuses, sender):
     states = store.state.setdefault('source_alerts', {})
+    non_failure_statuses = {'THROTTLED', 'COOLDOWN'}
     for source, status in statuses.items():
-        if status == 'NOT_CONFIGURED':
+        if status == 'NOT_CONFIGURED' or status in non_failure_statuses:
             continue
         state = states.setdefault(source, {'failures': 0, 'alerted': False})
         label = {'linkedin': 'LinkedIn'}.get(source, source)

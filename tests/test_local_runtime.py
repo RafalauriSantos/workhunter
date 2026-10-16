@@ -157,6 +157,18 @@ def test_alert_after_two_failures_and_single_recovery(tmp_path):
     assert len(messages) == 2
 
 
+def test_throttled_source_does_not_trigger_failure_alert(tmp_path):
+    from core.operational_alerts import update_source_alerts
+    store = SQLiteStore(tmp_path / 'state.db')
+    messages = []
+
+    update_source_alerts(store, {'linkedin': 'THROTTLED'}, messages.append)
+    update_source_alerts(store, {'linkedin': 'THROTTLED'}, messages.append)
+
+    assert messages == []
+    assert 'linkedin' not in store.state.get('source_alerts', {})
+
+
 def test_stale_writer_cannot_overwrite(tmp_path):
     first = SQLiteStore(tmp_path / 'state.db')
     second = SQLiteStore(first.filepath)
