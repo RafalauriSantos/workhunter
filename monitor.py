@@ -312,6 +312,7 @@ def run_check():
                 detail_limit=config.get("gupy_detail_enrichment_limit", 5),
                 max_age_hours=config.get("gupy_max_age_hours", 72),
                 require_publication_date=config.get("gupy_require_publication_date", True),
+                detail_cache=store.state.setdefault("gupy_detail_cache", {}),
             )
             candidate_audit_collectors.append(gupy_col)
             result = collect_result(gupy_col)

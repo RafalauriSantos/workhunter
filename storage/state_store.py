@@ -36,6 +36,7 @@ class StateStore:
                         "feedback": data.get("feedback", []),
                         "delivery_audit": data.get("delivery_audit", []),
                         "candidate_rejections": data.get("candidate_rejections", []),
+                        "gupy_detail_cache": data.get("gupy_detail_cache", {}),
                     }
                 else:
                     return default_state

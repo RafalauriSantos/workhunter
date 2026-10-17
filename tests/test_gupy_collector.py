@@ -105,6 +105,108 @@ def test_gupy_collector_enriches_missing_description_with_job_detail():
     assert jobs[0].description == "React, TypeScript e Node.js"
 
 
+def test_gupy_detail_request_sends_numeric_job_id_to_mcp():
+    session = MockSession()
+    collector = GupyCollector(session, [], detail_limit=1)
+
+    collector._get_detail('10939233')
+
+    arguments = session.calls[0]['json']['params']['arguments']
+    assert arguments['id'] == 10939233
+    assert isinstance(arguments['id'], int)
+
+
+def test_gupy_enriches_missing_publication_date_from_flat_detail_payload():
+    from datetime import datetime, timedelta, timezone
+
+    published_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    class Response:
+        status_code = 200
+        encoding = 'utf-8'
+
+        def __init__(self, data):
+            self.text = 'data: ' + json.dumps({
+                'result': {'content': [{'text': json.dumps({'data': data})}]}
+            })
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            method = kwargs['json']['params']['name']
+            if method == 'search_jobs':
+                return Response({'data': [{
+                    'id': 10939233, 'name': 'Desenvolvedor React Junior',
+                    'careerPageName': 'Empresa Tech', 'city': 'Remoto',
+                    'jobUrl': 'https://empresa.gupy.io/jobs/10939233',
+                    'description': 'React e TypeScript',
+                }]})
+            return Response({'id': 10939233, 'publishedDate': published_at})
+
+    session = Session()
+    collector = GupyCollector(
+        session, [{'term': 'React'}], detail_limit=1,
+        max_age_hours=72, require_publication_date=True,
+    )
+
+    jobs = collector.collect()
+
+    assert len(jobs) == 1
+    assert jobs[0].published_at == published_at
+    detail_arguments = session.calls[1]['json']['params']['arguments']
+    assert detail_arguments == {'id': 10939233}
+
+
+def test_gupy_caches_detail_lookup_across_collector_cycles():
+    class Response:
+        status_code = 200
+        encoding = 'utf-8'
+
+        def __init__(self, data):
+            self.text = 'data: ' + json.dumps({
+                'result': {'content': [{'text': json.dumps({'data': data})}]}
+            })
+
+    class Session:
+        def __init__(self):
+            self.detail_calls = 0
+
+        def post(self, *args, **kwargs):
+            method = kwargs['json']['params']['name']
+            if method == 'search_jobs':
+                return Response({'data': [{
+                    'id': 10939233, 'name': 'Desenvolvedor React Junior',
+                    'careerPageName': 'Empresa Tech', 'city': 'Remoto',
+                    'jobUrl': 'https://empresa.gupy.io/jobs/10939233',
+                    'description': 'React e TypeScript',
+                }]})
+            self.detail_calls += 1
+            return Response({'id': 10939233, 'publishedDate': '2020-01-01T00:00:00Z'})
+
+    session = Session()
+    state = {'gupy_detail_cache': {}}
+
+    def collect_once():
+        collector = GupyCollector(
+            session, [{'term': 'React'}], detail_limit=1,
+            max_age_hours=72, require_publication_date=True,
+            detail_cache=state['gupy_detail_cache'],
+        )
+        assert collector.collect() == []
+        return collector
+
+    first = collect_once()
+    second = collect_once()
+
+    assert first.detail_attempts == 1
+    assert second.detail_attempts == 0
+    assert session.detail_calls == 1
+    assert state['gupy_detail_cache']['10939233']['detail']['publishedDate'] == '2020-01-01T00:00:00Z'
+
+
 def test_gupy_collector_discards_jobs_outside_configured_recency_window():
     class OldSession(MockSession):
         def post(self, *args, **kwargs):
