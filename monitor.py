@@ -28,7 +28,7 @@ from core.query_planner import plan_searches, unique_searches, rotate_searches
 from core.delivery_workflow import finalize_delivery
 from core.eligibility import classify_score, classify_evidence, classify_location
 from core.scope_analyzer import analyze_scope
-from core.metrics import summarize_cycle
+from core.metrics import summarize_cycle, build_funnel_report
 from core.candidate_audit import persist_rejections
 from core.ranking import order_for_alerts
 from core import llm_judge
@@ -797,6 +797,7 @@ def run_check():
         notified_count,
         {"pcd": discarded_pcd, "location": discarded_location, "seniority": discarded_senior, "score": discarded_score, "scope": discarded_scope},
         {"gupy": gupy_status, "linkedin": linkedin_status, "rss": rss_status, "github": github_status, "trampos": trampos_status},
+        seen_count=discarded_seen,
     )
     health_report = {
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -809,18 +810,10 @@ def run_check():
             "github": {"status": github_status, "discovered": len(discovered_github)},
             "trampos": {"status": trampos_status, "discovered": len(discovered_trampos)},
         },
-        "funnel": {
-            "raw": len(discovered_jobs),
-            "unique": len(unique_jobs),
-            "seen": discarded_seen,
-            "discarded": {
-                "pcd": discarded_pcd,
-                "location": discarded_location,
-                "seniority": discarded_senior,
-                "score": discarded_score,
-            },
-            "notified": notified_count,
-        },
+        "funnel": build_funnel_report(
+            len(discovered_jobs), len(unique_jobs), discarded_seen,
+            cycle_metrics["discarded_counts"], notified_count,
+        ),
         "metrics": cycle_metrics,
         "llm_calls_today": today_llm_calls,
         "llm_fallbacks": fallback_count,
