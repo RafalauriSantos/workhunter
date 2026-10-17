@@ -200,7 +200,14 @@ Register a URL with the lightweight CLI:
 ./workhunter add 'https://www.linkedin.com/jobs/view/123456789/'
 ./workhunter worker-once
 ./workhunter diagnose
+./workhunter audit-job linkedin 123456789
 ```
+
+`audit-job` is read-only. It reports retained search/query IDs, publication and
+first-seen timestamps, source rejection reasons, decisions, deduplication data,
+and delivery attempts for one vacancy. `--json` prints the full trace. If the
+result says `no_collection_evidence_in_retained_audit`, it means no matching
+evidence was retained; it does not prove the source never returned that vacancy.
 
 The browser extension under `tools/linkedin_extension/` captures relevant
 posts visible in the LinkedIn feed and sends them to the loopback receiver.

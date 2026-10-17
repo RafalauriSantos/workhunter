@@ -2,10 +2,134 @@
 import argparse
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 from storage.sqlite_store import SQLiteStore
 from core.source_identity import extract_source_identity
+
+
+def audit_job(store, source, native_id):
+    """Return the retained per-vacancy search, collection, decision and delivery evidence."""
+    source, native_id = str(source), str(native_id)
+    namespaced_id = f'{source}:{native_id}'
+    with store.connect() as db:
+        db.row_factory = sqlite3.Row
+        job_row = db.execute(
+            'SELECT payload FROM jobs WHERE source=? AND external_id=?',
+            (source, native_id),
+        ).fetchone()
+        attempt_rows = db.execute('''SELECT cycle_id,operation,query,started,finished,
+            result_count,native_ids,http_status,error_type,timed_out,reason
+            FROM collection_attempts WHERE source=? ORDER BY id''', (source,)).fetchall()
+        rejection_rows = db.execute('''SELECT cycle_id,title,query,url,published_at,
+            stage,reason,created_at FROM candidate_rejections
+            WHERE source=? AND source_job_id=? ORDER BY id''', (source, native_id)).fetchall()
+        event_rows = db.execute("SELECT payload FROM events WHERE kind='decision'").fetchall()
+        outbox_rows = db.execute('SELECT fingerprint,payload,status,attempts,retry_at FROM outbox').fetchall()
+        channel_rows = db.execute('SELECT fingerprint,channel,status,created FROM channel_attempts').fetchall()
+        state_row = db.execute("SELECT value FROM metadata WHERE key='state'").fetchone()
+        state = json.loads(state_row[0]) if state_row else {}
+
+    search_attempts = []
+    for row in attempt_rows:
+        try:
+            ids = [str(item) for item in json.loads(row['native_ids'] or '[]')]
+        except (TypeError, ValueError):
+            continue
+        if native_id not in ids:
+            continue
+        try:
+            query = json.loads(row['query']) if row['query'] else None
+        except (TypeError, ValueError):
+            query = row['query']
+        search_attempts.append({
+            'cycle_id': row['cycle_id'], 'operation': row['operation'], 'query': query,
+            'started': row['started'], 'finished': row['finished'],
+            'result_count': row['result_count'], 'http_status': row['http_status'],
+            'error_type': row['error_type'], 'timed_out': bool(row['timed_out']),
+            'reason': row['reason'],
+        })
+
+    rejections = []
+    for row in rejection_rows:
+        try:
+            query = json.loads(row['query']) if row['query'] else None
+        except (TypeError, ValueError):
+            query = row['query']
+        rejections.append({
+            'cycle_id': row['cycle_id'], 'title': row['title'], 'query': query,
+            'url': row['url'], 'published_at': row['published_at'],
+            'stage': row['stage'], 'reason': row['reason'], 'created_at': row['created_at'],
+        })
+
+    decisions = []
+    for row in event_rows:
+        try:
+            decision = json.loads(row['payload'])
+        except (TypeError, ValueError):
+            continue
+        if decision.get('source') == source and str(decision.get('job_id')) in {native_id, namespaced_id}:
+            decisions.append(decision)
+
+    payload = json.loads(job_row['payload']) if job_row else None
+    matched_outbox = []
+    matched_fingerprints = set()
+    for row in outbox_rows:
+        try:
+            data = json.loads(row['payload'])
+        except (TypeError, ValueError):
+            continue
+        sources = data.get('sources') or {}
+        identity = sources.get(source) or {}
+        aliases = (data.get('analysis') or {}).get('duplicate_listings') or []
+        if (str(identity.get('source_job_id', '')) == native_id or
+                any(str(item.get('source_job_id', '')) == native_id for item in aliases)):
+            matched_fingerprints.add(row['fingerprint'])
+            matched_outbox.append({
+                'status': row['status'], 'attempts': row['attempts'],
+                'retry_at': row['retry_at'], 'fingerprint': row['fingerprint'],
+            })
+    channels = [{
+        'channel': row['channel'], 'status': row['status'], 'created_at': row['created'],
+    } for row in channel_rows if row['fingerprint'] in matched_fingerprints]
+    delivery_history = [item for item in state.get('delivery_audit', []) if (
+        namespaced_id in [str(value) for value in item.get('source_ids', [])]
+        or native_id in [str(value) for value in item.get('source_ids', [])]
+    )]
+
+    if decisions:
+        latest = decisions[-1]
+        decision_name = latest.get('decision', '')
+        classification = ('delivered' if decision_name == 'DELIVERED' else
+                          'delivery_failed' if decision_name == 'DELIVERY_FAILED' else 'discarded')
+        decision_summary = {
+            'decision': decision_name, 'reason': latest.get('decision_reason'),
+            'score': latest.get('final_score'), 'timestamp': latest.get('timestamp'),
+        }
+    else:
+        decision_summary = None
+        classification = ('collected_no_decision' if payload else
+                          'source_filtered' if rejections else
+                          'found_in_search_not_persisted' if search_attempts else
+                          'no_collection_evidence_in_retained_audit')
+
+    source_info = (payload or {}).get('sources', {}).get(source, {})
+    return {
+        'source': source, 'native_id': native_id, 'classification': classification,
+        'title': (payload or {}).get('title') or (rejections[-1]['title'] if rejections else None),
+        'published_at': (payload or {}).get('published_at') or (rejections[-1]['published_at'] if rejections else None),
+        'first_seen': source_info.get('first_seen') or (payload or {}).get('first_seen'),
+        'search_attempts': search_attempts, 'source_rejections': rejections,
+        'stored_job': payload,
+        'decision': decision_summary,
+        'outbox': matched_outbox, 'channel_attempts': channels,
+        'delivery_history': delivery_history,
+        'deduplication': {
+            'source_count': len((payload or {}).get('sources') or {}),
+            'duplicate_listings': ((payload or {}).get('analysis') or {}).get('duplicate_listings', []),
+        },
+    }
 
 
 def diagnose(store):
@@ -189,6 +313,10 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     add = sub.add_parser('add', help='register a manually found job URL')
     add.add_argument('url')
+    audit_cmd = sub.add_parser('audit-job', help='show retained evidence for one source vacancy')
+    audit_cmd.add_argument('source')
+    audit_cmd.add_argument('native_id')
+    audit_cmd.add_argument('--json', action='store_true', help='print the full vacancy evidence trace as JSON')
     diagnose_cmd = sub.add_parser('diagnose', help='classify manually found URLs against collection evidence')
     diagnose_cmd.add_argument('--json', action='store_true', help='print the full vacancy evidence trace as JSON')
     sub.add_parser('worker-once', help='run one isolated manual analysis cycle')
@@ -230,6 +358,19 @@ def main(argv=None):
                 if item.get('rejection_stage'):
                     details += f" filtered_at={item['rejection_stage']}"
                 print(f"{item['classification']}: {item['source']}:{item['native_id'] or '-'}{details} {item['url']}")
+        return 0
+    if args.command == 'audit-job':
+        data_dir = Path(os.getenv('JOB_FINDER_DATA_DIR', Path.home() / '.job-finder'))
+        result = audit_job(SQLiteStore(data_dir / 'state.db'), args.source, args.native_id)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(f"{result['classification']}: {result['source']}:{result['native_id']} — {result.get('title') or 'sem registro local'}")
+            print(f"Publicação: {result.get('published_at') or 'desconhecida'} | Primeira captura: {result.get('first_seen') or 'sem captura persistida'}")
+            print(f"Consultas relacionadas: {len(result['search_attempts'])} | Rejeições: {len(result['source_rejections'])}")
+            if result.get('decision'):
+                print(f"Decisão: {result['decision']['decision']} — {result['decision']['reason'] or 'sem motivo'}")
+            print(f"Outbox: {len(result['outbox'])} | Tentativas por canal: {len(result['channel_attempts'])}")
         return 0
     if args.command == 'worker-once':
         from workhunter_worker import run as run_worker
