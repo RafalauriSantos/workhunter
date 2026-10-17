@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import hashlib
 import json
@@ -11,7 +11,7 @@ class JobSource:
     source_name: str       # "gupy", "linkedin", "google_news", etc.
     source_job_id: str     # ID original na plataforma
     url: str               # Link direto para a candidatura
-    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    first_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
@@ -42,7 +42,7 @@ class Job:
     operational_seniority: str = ""
     published_at: str = ""                # Timestamp ISO-8601 quando fornecido pela fonte
     sources: Dict[str, JobSource] = field(default_factory=dict)
-    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    first_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def add_source(self, source_name: str, source_job_id: str, url: str):
         """Associa uma nova fonte a esta vaga (suporte a vaga multi-fonte)."""
