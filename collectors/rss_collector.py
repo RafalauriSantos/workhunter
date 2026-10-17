@@ -1,11 +1,13 @@
 import re
 import email.utils
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 import requests
 from datetime import datetime, timezone
 from html import unescape
+from requests.adapters import HTTPAdapter
 from collectors.base import BaseCollector
 from models.job import Job
 from core.normalizer import normalize_title
@@ -66,6 +68,8 @@ def classify_freshness(dt: Optional[datetime], max_age_hours: int = 72) -> Tuple
 class RssCollector(BaseCollector):
     """Coletor de vagas via feeds RSS 2.0 e Atom com suporte à SPEC-008."""
 
+    MAX_CONCURRENT_FEEDS = 4
+
     def __init__(self, http_session: requests.Session, configs: List[Dict[str, Any]], resolve_urls: bool = False, min_description_chars: int = 0):
         self.http = http_session
         self.configs = configs
@@ -73,12 +77,13 @@ class RssCollector(BaseCollector):
         self.min_description_chars = max(0, int(min_description_chars or 0))
         self.collection_attempts = []
 
-    def _parse_feed(self, feed_url: str) -> List[Dict[str, Any]]:
+    def _parse_feed(self, feed_url: str, http_session=None) -> List[Dict[str, Any]]:
         """Faz fetch e parse do XML do feed, retorna lista de {id, title, link, pub_date}."""
+        http_session = http_session or self.http
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         try:
             started = datetime.now(timezone.utc).isoformat()
-            resp = self.http.get(feed_url, headers=headers, timeout=15)
+            resp = http_session.get(feed_url, headers=headers, timeout=15)
             if resp.status_code != 200:
                 self.record_attempt('rss', 'feed', started, query={'url': feed_url},
                                     http_status=resp.status_code, error_type=f'HTTP_{resp.status_code}')
@@ -136,12 +141,55 @@ class RssCollector(BaseCollector):
                 return items
 
         except Exception as e:
+            error_text = str(e)
+            normalized_error = error_text.lower()
+            timed_out = (
+                isinstance(e, requests.Timeout)
+                or "timed out" in normalized_error
+                or "timeout" in normalized_error
+            )
+            retry_count = 1 if "max retries exceeded" in normalized_error else 0
             self.record_attempt('rss', 'feed', locals().get('started', datetime.now(timezone.utc).isoformat()),
-                                query={'url': feed_url}, error_type=type(e).__name__,
-                                timed_out=isinstance(e, requests.Timeout), reason=str(e))
-            self.report_issue(type(e).__name__)
+                                query={'url': feed_url},
+                                error_type='Timeout' if timed_out else type(e).__name__,
+                                timed_out=timed_out, retry_count=retry_count, reason=error_text)
+            self.report_issue('Timeout' if timed_out else type(e).__name__)
             print(f"[ERRO RssCollector] {e}")
         return []
+
+    def _new_feed_session(self):
+        """Create an isolated requests session while preserving the HTTP policy."""
+        if not isinstance(self.http, requests.Session):
+            return self.http, False
+
+        session = requests.Session()
+        session.headers.update(self.http.headers)
+        session.cookies.update(self.http.cookies)
+        session.auth = self.http.auth
+        session.proxies.update(self.http.proxies)
+        session.hooks = {name: list(callbacks) for name, callbacks in self.http.hooks.items()}
+        session.params.update(self.http.params)
+        session.verify = self.http.verify
+        session.cert = self.http.cert
+        session.trust_env = self.http.trust_env
+        session.max_redirects = self.http.max_redirects
+        for prefix, adapter in self.http.adapters.items():
+            if isinstance(adapter, HTTPAdapter):
+                session.mount(prefix, HTTPAdapter(
+                    pool_connections=adapter._pool_connections,
+                    pool_maxsize=adapter._pool_maxsize,
+                    max_retries=adapter.max_retries,
+                    pool_block=adapter._pool_block,
+                ))
+        return session, True
+
+    def _fetch_feed(self, feed_url: str):
+        session, owns_session = self._new_feed_session()
+        try:
+            return self._parse_feed(feed_url, session)
+        finally:
+            if owns_session:
+                session.close()
 
     def _matches_filters(self, title_lower: str, config: Dict[str, Any]) -> bool:
         """Aplica keyword/exclude_keyword filters do config ao título do item RSS."""
@@ -191,14 +239,23 @@ class RssCollector(BaseCollector):
 
     def collect(self) -> List[Job]:
         discovered: List[Job] = []
+        feed_configs = [cfg for cfg in self.configs if cfg.get("url", "")]
+        worker_count = min(self.MAX_CONCURRENT_FEEDS, len(feed_configs))
+        if worker_count:
+            # Feed servers are independent. A slow vendor feed must not delay
+            # every later RSS query, while the small worker cap keeps request
+            # pressure bounded.
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rss-feed") as executor:
+                feed_results = executor.map(
+                    self._fetch_feed,
+                    (cfg["url"] for cfg in feed_configs),
+                )
+                feed_items = list(feed_results)
+        else:
+            feed_items = []
 
-        for cfg in self.configs:
-            feed_url = cfg.get("url", "")
+        for cfg, raw_items in zip(feed_configs, feed_items):
             company = cfg.get("company", cfg.get("description", "RSS"))
-            if not feed_url:
-                continue
-
-            raw_items = self._parse_feed(feed_url)
 
             for item in raw_items:
                 title_clean = normalize_title(item["title"])

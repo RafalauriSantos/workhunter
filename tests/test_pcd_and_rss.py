@@ -1,6 +1,8 @@
 import os
 import sys
 import xml.etree.ElementTree as ET
+import threading
+import time
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -157,6 +159,71 @@ class TestRssCollector:
         col = self._make_collector("<rss><channel></channel></rss>", configs)
         jobs = col.collect()
         assert jobs == []
+
+    def test_fetches_multiple_feeds_concurrently(self):
+        from collectors.rss_collector import RssCollector
+
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        class Session:
+            def get(self, *args, **kwargs):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with lock:
+                    active -= 1
+                response = MagicMock(status_code=200, content=b"<rss><channel/></rss>")
+                return response
+
+        configs = [{"url": f"https://feed{i}.example/rss"} for i in range(4)]
+        RssCollector(Session(), configs).collect()
+
+        assert max_active > 1
+
+    def test_wrapped_read_timeout_is_reported_as_timeout_after_retry(self):
+        import requests
+        from collectors.rss_collector import RssCollector
+
+        class Session:
+            def get(self, *args, **kwargs):
+                raise requests.ConnectionError(
+                    "HTTPSConnectionPool: Max retries exceeded after Read timed out"
+                )
+
+        collector = RssCollector(Session(), [{"url": "https://feed.example/rss"}])
+        collector.collect()
+
+        attempt = collector.collection_attempts[0]
+        assert attempt["error_type"] == "Timeout"
+        assert attempt["timed_out"] is True
+        assert attempt["retry_count"] == 1
+
+    def test_worker_sessions_are_isolated_and_preserve_retry_policy(self):
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        from collectors.rss_collector import RssCollector
+
+        base_session = requests.Session()
+        base_session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, read=1)))
+        collector = RssCollector(base_session, [])
+
+        first, owns_first = collector._new_feed_session()
+        second, owns_second = collector._new_feed_session()
+        try:
+            assert owns_first and owns_second
+            assert first is not second
+            assert first.adapters["https://"] is not second.adapters["https://"]
+            assert first.adapters["https://"].max_retries.total == 1
+            assert first.adapters["https://"].max_retries.read == 1
+        finally:
+            first.close()
+            second.close()
+            base_session.close()
 
 
 class TestRssRelevanceScoring:
