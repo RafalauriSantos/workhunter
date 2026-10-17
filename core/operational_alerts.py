@@ -44,8 +44,8 @@ def update_source_alerts(store, statuses, sender):
                 if status == 'PARTIAL':
                     message = (
                         f'Job Finder: {label} degraded in consecutive cycles. '
-                        'Some searches were rate-limited (HTTP 429); collected results were preserved '
-                        'and the remaining searches will rotate in the next cycle. Check local diagnostics.'
+                        'Some searches failed or timed out; collected results were preserved '
+                        'and the remaining sources will continue in the next cycle. Check local diagnostics.'
                     )
                 else:
                     message = f'Job Finder: {label} failed in consecutive cycles. Check local diagnostics.'
