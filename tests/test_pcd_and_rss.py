@@ -112,7 +112,7 @@ class TestRssCollector:
         jobs = col.collect()
         assert len(jobs) == 3
         assert all(isinstance(j, Job) for j in jobs)
-        assert col.http.get.call_args.kwargs['timeout'] == 8
+        assert col.http.get.call_args.kwargs['timeout'] == (3, 5)
 
     def test_parses_atom_feed(self):
         configs = [{"url": "https://fake.url/atom", "company": "Flavia Nasser"}]

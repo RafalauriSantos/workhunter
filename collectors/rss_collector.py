@@ -69,7 +69,7 @@ class RssCollector(BaseCollector):
     """Coletor de vagas via feeds RSS 2.0 e Atom com suporte à SPEC-008."""
 
     MAX_CONCURRENT_FEEDS = 4
-    REQUEST_TIMEOUT_SECONDS = 8
+    REQUEST_TIMEOUT = (3, 5)
 
     def __init__(self, http_session: requests.Session, configs: List[Dict[str, Any]], resolve_urls: bool = False, min_description_chars: int = 0):
         self.http = http_session
@@ -87,7 +87,7 @@ class RssCollector(BaseCollector):
             resp = http_session.get(
                 feed_url,
                 headers=headers,
-                timeout=self.REQUEST_TIMEOUT_SECONDS,
+                timeout=self.REQUEST_TIMEOUT,
             )
             if resp.status_code != 200:
                 self.record_attempt('rss', 'feed', started, query={'url': feed_url},
