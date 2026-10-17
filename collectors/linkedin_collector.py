@@ -168,6 +168,12 @@ class LinkedInCollector(BaseCollector):
                     company_match = re.search(r'<h4[^>]*class=\"[^\"]*base-search-card__subtitle[^\"]*\"[^>]*>.*?<a[^>]*>\s*([^<]+)\s*</a>', card, re.DOTALL)
                     link_match = re.search(r'<a[^>]*class=\"[^\"]*base-card__full-link[^\"]*\"[^>]*href=\"([^\"]+)\"', card)
                     loc_match = re.search(r'<span[^>]*class=\"[^\"]*job-search-card__location[^\"]*\"[^>]*>\s*([^<]+)\s*</span>', card)
+                    published_match = re.search(
+                        r'<time\b[^>]*\bdatetime=[\"\']([^\"\']+)[\"\']',
+                        card,
+                        re.IGNORECASE,
+                    )
+                    published_at = published_match.group(1).strip() if published_match else ''
 
                     if not title_match or not link_match:
                         rejected_id_match = re.search(
@@ -183,6 +189,7 @@ class LinkedInCollector(BaseCollector):
                             'Card sem título ou link de vaga reconhecível',
                             query=audit_query,
                             url=link_match.group(1) if link_match else '',
+                            published_at=published_at,
                         )
                         continue
 
@@ -207,6 +214,7 @@ class LinkedInCollector(BaseCollector):
                         location=location,
                         raw_url=raw_link,
                         technologies=techs,
+                        published_at=published_at,
                     )
                     job.add_source("linkedin", job_id, raw_link)
                     jobs.append(job)

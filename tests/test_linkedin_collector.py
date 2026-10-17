@@ -26,6 +26,7 @@ SAMPLE_LINKEDIN_HTML = """
                 <span class="job-search-card__location">
                     Sorocaba, SP
                 </span>
+                <time class="job-search-card__listdate" datetime="2026-10-17T10:00:00Z">há 6 horas</time>
             </div>
         </div>
     </li>
@@ -75,6 +76,7 @@ def test_linkedin_collector_parses_html_successfully(monkeypatch):
     assert "React" in j1.title or "react" in j1.technologies
     assert j1.company == "Empresa Tech Inovadora"
     assert j1.location == "Sorocaba, SP"
+    assert j1.published_at == "2026-10-17T10:00:00Z"
     assert "linkedin" in j1.sources
     assert j1.sources["linkedin"].source_job_id == "3910293841"
 
