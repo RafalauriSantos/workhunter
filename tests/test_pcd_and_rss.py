@@ -112,6 +112,7 @@ class TestRssCollector:
         jobs = col.collect()
         assert len(jobs) == 3
         assert all(isinstance(j, Job) for j in jobs)
+        assert col.http.get.call_args.kwargs['timeout'] == 8
 
     def test_parses_atom_feed(self):
         configs = [{"url": "https://fake.url/atom", "company": "Flavia Nasser"}]
@@ -205,7 +206,7 @@ class TestRssCollector:
         assert attempt["timed_out"] is True
         assert attempt["retry_count"] == 1
 
-    def test_worker_sessions_are_isolated_and_preserve_retry_policy(self):
+    def test_worker_sessions_are_isolated_and_disable_retries_for_periodic_feeds(self):
         import requests
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
@@ -221,8 +222,8 @@ class TestRssCollector:
             assert owns_first and owns_second
             assert first is not second
             assert first.adapters["https://"] is not second.adapters["https://"]
-            assert first.adapters["https://"].max_retries.total == 1
-            assert first.adapters["https://"].max_retries.read == 1
+            assert first.adapters["https://"].max_retries.total == 0
+            assert second.adapters["https://"].max_retries.total == 0
         finally:
             first.close()
             second.close()

@@ -69,6 +69,7 @@ class RssCollector(BaseCollector):
     """Coletor de vagas via feeds RSS 2.0 e Atom com suporte à SPEC-008."""
 
     MAX_CONCURRENT_FEEDS = 4
+    REQUEST_TIMEOUT_SECONDS = 8
 
     def __init__(self, http_session: requests.Session, configs: List[Dict[str, Any]], resolve_urls: bool = False, min_description_chars: int = 0):
         self.http = http_session
@@ -83,7 +84,11 @@ class RssCollector(BaseCollector):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         try:
             started = datetime.now(timezone.utc).isoformat()
-            resp = http_session.get(feed_url, headers=headers, timeout=15)
+            resp = http_session.get(
+                feed_url,
+                headers=headers,
+                timeout=self.REQUEST_TIMEOUT_SECONDS,
+            )
             if resp.status_code != 200:
                 self.record_attempt('rss', 'feed', started, query={'url': feed_url},
                                     http_status=resp.status_code, error_type=f'HTTP_{resp.status_code}')
@@ -178,7 +183,10 @@ class RssCollector(BaseCollector):
                 session.mount(prefix, HTTPAdapter(
                     pool_connections=adapter._pool_connections,
                     pool_maxsize=adapter._pool_maxsize,
-                    max_retries=adapter.max_retries,
+                    # RSS feeds are polled every 30 minutes. A failed feed can
+                    # be retried on the next cycle; retrying inline stalls
+                    # unrelated sources and amplifies load on flaky hosts.
+                    max_retries=0,
                     pool_block=adapter._pool_block,
                 ))
         return session, True
