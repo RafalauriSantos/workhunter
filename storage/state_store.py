@@ -35,6 +35,7 @@ class StateStore:
                         "delivery_claims": data.get("delivery_claims", {}),
                         "feedback": data.get("feedback", []),
                         "delivery_audit": data.get("delivery_audit", []),
+                        "candidate_rejections": data.get("candidate_rejections", []),
                     }
                 else:
                     return default_state
@@ -333,6 +334,17 @@ class StateStore:
         self.state["recent_decisions"].append(entry)
         if len(self.state["recent_decisions"]) > max_history:
             self.state["recent_decisions"] = self.state["recent_decisions"][-max_history:]
+
+    def record_candidate_rejection(self, rejection):
+        self.record_candidate_rejections([rejection])
+
+    def record_candidate_rejections(self, rejections):
+        if not rejections:
+            return
+        if "candidate_rejections" not in self.state:
+            self.state["candidate_rejections"] = []
+        self.state["candidate_rejections"].extend(dict(item) for item in rejections)
+        self.state["candidate_rejections"] = self.state["candidate_rejections"][-1000:]
 
     def record_feedback(self, fingerprint: str, feedback: str, note: str = "", source: str = "human"):
         """Registra o retorno humano usado na recalibracao posterior."""

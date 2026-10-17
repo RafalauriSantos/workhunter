@@ -71,6 +71,16 @@ class TramposCollector(BaseCollector):
                     full_text = f"{title_clean} {desc}"
 
                     if not self._matches_filters(full_text):
+                        excluded = [word for word in self.exclude_keywords if word in full_text.lower()]
+                        matched = [word for word in self.keywords if word in full_text.lower()]
+                        reason = (f"Anúncio contém termo excluído: {', '.join(excluded)}" if excluded
+                                  else 'Anúncio não corresponde às palavras-chave configuradas')
+                        self.record_candidate_rejection(
+                            'trampos', opp.get('id'), title_clean, 'source_filter', reason,
+                            query={'page': page, 'keywords': self.keywords,
+                                   'exclude_keywords': self.exclude_keywords, 'matched_keywords': matched},
+                            url=opp.get('url', ''), published_at=opp.get('published_at', ''),
+                        )
                         continue
 
                     company = opp.get("company_name") or "Empresa Confidencial"

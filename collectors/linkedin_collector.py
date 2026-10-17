@@ -113,6 +113,7 @@ class LinkedInCollector(BaseCollector):
         jobs = []
         seen_ids = set()
         stats = {
+            "query_id": search_cfg.get("query_id"),
             "keywords": keywords,
             "time_range": time_range,
             "seniority": search_cfg.get("seniority"),
@@ -146,15 +147,22 @@ class LinkedInCollector(BaseCollector):
 
                 resp.encoding = "utf-8"
                 cards = re.findall(r'<li[^>]*>(.*?)</li>', resp.text, re.DOTALL)
-                page_ids = re.findall(r'data-entity-urn=\\"urn:li:jobPosting:(\\d+)\\"', resp.text)
-                self.record_attempt('linkedin', 'search', started, query=params, page=page,
+                page_ids = re.findall(
+                    r"data-entity-urn\s*=\s*[\"']urn:li:jobPosting:(\d+)[\"']",
+                    resp.text,
+                    re.IGNORECASE,
+                )
+                audit_query = {**params}
+                if search_cfg.get("query_id"):
+                    audit_query["query_id"] = search_cfg["query_id"]
+                self.record_attempt('linkedin', 'search', started, query=audit_query, page=page,
                                     http_status=resp.status_code, result_count=len(cards), native_ids=page_ids)
                 stats["cards"] += len(cards)
                 if not cards:
                     break
 
                 page_new_jobs = 0
-                for card in cards:
+                for card_index, card in enumerate(cards):
                     urn_match = re.search(r'data-entity-urn=\"urn:li:jobPosting:(\d+)\"', card)
                     title_match = re.search(r'<h3[^>]*class=\"[^\"]*base-search-card__title[^\"]*\"[^>]*>\s*([^<]+)\s*</h3>', card)
                     company_match = re.search(r'<h4[^>]*class=\"[^\"]*base-search-card__subtitle[^\"]*\"[^>]*>.*?<a[^>]*>\s*([^<]+)\s*</a>', card, re.DOTALL)
@@ -162,6 +170,20 @@ class LinkedInCollector(BaseCollector):
                     loc_match = re.search(r'<span[^>]*class=\"[^\"]*job-search-card__location[^\"]*\"[^>]*>\s*([^<]+)\s*</span>', card)
 
                     if not title_match or not link_match:
+                        rejected_id_match = re.search(
+                            r"data-entity-urn\s*=\s*[\"']urn:li:jobPosting:(\d+)[\"']",
+                            card,
+                            re.IGNORECASE,
+                        )
+                        self.record_candidate_rejection(
+                            'linkedin',
+                            rejected_id_match.group(1) if rejected_id_match else f'card-{page}-{card_index}',
+                            title_match.group(1).strip() if title_match else '',
+                            'source_parse',
+                            'Card sem título ou link de vaga reconhecível',
+                            query=audit_query,
+                            url=link_match.group(1) if link_match else '',
+                        )
                         continue
 
                     raw_title = title_match.group(1).strip()
@@ -210,7 +232,8 @@ class LinkedInCollector(BaseCollector):
             stats["error"] = str(e)
             print(f"[ERRO LinkedInCollector] {e}")
             self.record_attempt('linkedin', 'search', started if 'started' in locals() else datetime.now(timezone.utc).isoformat(),
-                                query=base_params, error_type=type(e).__name__, timed_out=isinstance(e, requests.Timeout), reason=str(e))
+                                query={**base_params, "query_id": search_cfg.get("query_id")},
+                                error_type=type(e).__name__, timed_out=isinstance(e, requests.Timeout), reason=str(e))
 
         stats["parsed_jobs"] = len(jobs)
         self.query_stats.append(stats)

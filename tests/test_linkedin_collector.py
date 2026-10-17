@@ -84,6 +84,24 @@ def test_linkedin_collector_parses_html_successfully(monkeypatch):
     assert j2.workplace_type == "remote"
 
 
+def test_linkedin_search_attempt_records_native_job_ids_and_query_id(monkeypatch):
+    session = requests.Session()
+    monkeypatch.setattr(session, "get", lambda *args, **kwargs: MockResponse(SAMPLE_LINKEDIN_HTML, 200))
+
+    collector = LinkedInCollector(session, [{
+        "query": "developer OR software",
+        "query_id": "broad-search-v1",
+    }])
+    collector.collect()
+
+    attempt = collector.collection_attempts[0]
+    assert attempt["native_ids"] == ["3910293841", "9920192831"]
+    assert attempt["query"]["query_id"] == "broad-search-v1"
+    parse_rejection = next(item for item in collector.rejected_candidates if item['source_job_id'] == 'card-0-1')
+    assert parse_rejection['stage'] == 'source_parse'
+    assert 'Card sem título' in parse_rejection['reason']
+
+
 def test_linkedin_collector_handles_http_errors_gracefully(monkeypatch):
     session = requests.Session()
     # Simula status 429 Too Many Requests ou 500 do LinkedIn

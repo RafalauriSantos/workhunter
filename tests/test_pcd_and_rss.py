@@ -133,6 +133,9 @@ class TestRssCollector:
         # "GFT abre vagas..." tem "vagas"
         # "Goomer lança novo recurso..." NÃO tem keywords
         assert len(jobs) == 2
+        rejection = next(item for item in col.rejected_candidates if item['source_job_id'] == 'article-002')
+        assert rejection['stage'] == 'source_filter'
+        assert 'palavras-chave' in rejection['reason']
 
     def test_exclude_keyword_filter_applied(self):
         """Itens com exclude_keywords são removidos."""

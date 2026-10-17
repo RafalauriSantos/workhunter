@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from storage.state_store import StateStore
@@ -39,6 +39,15 @@ class SQLiteStore(StateStore):
                     native_ids TEXT NOT NULL DEFAULT '[]', error_type TEXT,
                     timed_out INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0,
                     reason TEXT);
+                CREATE TABLE IF NOT EXISTS candidate_rejections(
+                    id INTEGER PRIMARY KEY, cycle_id TEXT NOT NULL, source TEXT NOT NULL,
+                    source_job_id TEXT NOT NULL, title TEXT NOT NULL, query TEXT,
+                    url TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_candidate_rejections_source_job
+                    ON candidate_rejections(source,source_job_id,created_at);
+                CREATE INDEX IF NOT EXISTS idx_candidate_rejections_created_at
+                    ON candidate_rejections(created_at);
                 CREATE TABLE IF NOT EXISTS manual_cases(
                     id INTEGER PRIMARY KEY, url TEXT NOT NULL, normalized_url TEXT NOT NULL,
                     source TEXT NOT NULL, native_id TEXT, identity_status TEXT NOT NULL,
@@ -169,6 +178,31 @@ class SQLiteStore(StateStore):
                 attempt.get('error_type'), int(bool(attempt.get('timed_out'))), int(attempt.get('retry_count', 0)),
                 attempt.get('reason')))
 
+    def record_candidate_rejection(self, rejection):
+        self.record_candidate_rejections([rejection])
+
+    def record_candidate_rejections(self, rejections):
+        if not rejections:
+            return
+        now = datetime.now(timezone.utc)
+        rows = []
+        for rejection in rejections:
+            rows.append((
+                rejection.get('cycle_id', ''), rejection.get('source', ''),
+                rejection.get('source_job_id', ''), rejection.get('title', ''),
+                json.dumps(rejection.get('query'), ensure_ascii=False, sort_keys=True, default=str)
+                if rejection.get('query') is not None else None,
+                rejection.get('url', ''), rejection.get('published_at', ''),
+                rejection.get('stage', ''), rejection.get('reason', ''),
+                rejection.get('rejected_at') or now.isoformat(),
+            ))
+        cutoff = (now - timedelta(days=90)).isoformat()
+        with self.connect() as db:
+            db.executemany('''INSERT INTO candidate_rejections
+                (cycle_id,source,source_job_id,title,query,url,published_at,stage,reason,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)''', rows)
+            db.execute('DELETE FROM candidate_rejections WHERE created_at < ?', (cutoff,))
+
     def record_manual_case(self, url, source=None, native_id=None, manual_found_at=None, raw_text='', author=''):
         from core.source_identity import extract_source_identity
         identity = extract_source_identity(url)
@@ -190,6 +224,46 @@ class SQLiteStore(StateStore):
         from dataclasses import asdict
         payload = json.dumps(asdict(job), ensure_ascii=False)
         with self.connect() as db:
+            payload_data = json.loads(payload)
+            existing_payloads = []
+            for source, item in job.sources.items():
+                row = db.execute(
+                    'SELECT payload FROM jobs WHERE source=? AND external_id=?',
+                    (source, item.source_job_id),
+                ).fetchone()
+                if row:
+                    try:
+                        existing_payloads.append(json.loads(row[0]))
+                    except (TypeError, ValueError):
+                        pass
+
+            def parse_seen(value):
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    return None
+
+            seen_values = [(parse_seen(payload_data.get('first_seen')), payload_data.get('first_seen'))]
+            seen_values.extend(
+                (parse_seen(value.get('first_seen')), value.get('first_seen'))
+                for value in existing_payloads if value.get('first_seen')
+            )
+            seen_values = [(instant, value) for instant, value in seen_values if instant is not None]
+            if seen_values:
+                payload_data['first_seen'] = min(seen_values, key=lambda item: item[0])[1]
+
+            for source, item in job.sources.items():
+                previous = next((value for value in existing_payloads
+                                 if source in (value.get('sources') or {})
+                                 and str((value['sources'][source] or {}).get('source_job_id')) == str(item.source_job_id)), None)
+                if previous:
+                    previous_source = previous['sources'][source]
+                    prior_seen = previous_source.get('first_seen')
+                    new_seen = (payload_data.get('sources') or {}).get(source, {}).get('first_seen')
+                    if parse_seen(prior_seen) and parse_seen(new_seen) and parse_seen(prior_seen) < parse_seen(new_seen):
+                        payload_data['sources'][source]['first_seen'] = prior_seen
+            payload = json.dumps(payload_data, ensure_ascii=False)
             for source, item in job.sources.items():
                 db.execute('INSERT INTO jobs VALUES (?,?,?) ON CONFLICT(source,external_id) '
                            'DO UPDATE SET payload=excluded.payload', (source, item.source_job_id, payload))

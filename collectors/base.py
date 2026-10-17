@@ -31,6 +31,23 @@ def collect_result(collector):
 class BaseCollector(ABC):
     def __init__(self):
         self.collection_attempts = []
+        self.rejected_candidates = []
+
+    def record_candidate_rejection(self, source, source_job_id, title, stage, reason,
+                                   *, query=None, url="", published_at=""):
+        if not hasattr(self, 'rejected_candidates'):
+            self.rejected_candidates = []
+        self.rejected_candidates.append({
+            'source': str(source or ''),
+            'source_job_id': str(source_job_id or ''),
+            'title': str(title or ''),
+            'stage': str(stage or ''),
+            'reason': str(reason or ''),
+            'query': query,
+            'url': str(url or ''),
+            'published_at': str(published_at or ''),
+            'rejected_at': datetime.now(timezone.utc).isoformat(),
+        })
 
     def record_attempt(self, source, operation, started, *, query=None, page=None,
                        cursor=None, http_status=None, result_count=0, native_ids=None,

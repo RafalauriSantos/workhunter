@@ -150,6 +150,11 @@ class GupyCollector(BaseCollector):
                 published_at = raw.get("publishedAt") or raw.get("createdAt") or ""
                 if self.max_age_hours and self.require_publication_date and not published_at:
                     self.query_stats[-1].setdefault("warnings", []).append("MISSING_PUBLICATION_DATE")
+                    self.record_candidate_rejection(
+                        'gupy', job_id, title, 'freshness_filter',
+                        'A API não forneceu data de publicação e a política exige uma data verificável',
+                        query=q_args, url=raw.get('jobUrl', ''),
+                    )
                     continue
                 if self.max_age_hours and published_at:
                     try:
@@ -157,10 +162,20 @@ class GupyCollector(BaseCollector):
                         if parsed.tzinfo is None:
                             parsed = parsed.replace(tzinfo=timezone.utc)
                         if datetime.now(timezone.utc) - parsed.astimezone(timezone.utc) > timedelta(hours=self.max_age_hours):
+                            self.record_candidate_rejection(
+                                'gupy', job_id, title, 'freshness_filter',
+                                f"Anúncio fora da janela de {self.max_age_hours} horas",
+                                query=q_args, url=raw.get('jobUrl', ''), published_at=published_at,
+                            )
                             continue
                     except ValueError:
                         self.query_stats[-1].setdefault("warnings", []).append("INVALID_PUBLICATION_DATE")
                         if self.require_publication_date:
+                            self.record_candidate_rejection(
+                                'gupy', job_id, title, 'freshness_filter',
+                                'Data de publicação inválida; não foi possível confirmar a recência',
+                                query=q_args, url=raw.get('jobUrl', ''), published_at=published_at,
+                            )
                             continue
                 
                 # URL canônica

@@ -29,6 +29,7 @@ from core.delivery_workflow import finalize_delivery
 from core.eligibility import classify_score, classify_evidence, classify_location
 from core.scope_analyzer import analyze_scope
 from core.metrics import summarize_cycle
+from core.candidate_audit import persist_rejections
 from core.ranking import order_for_alerts
 from core import llm_judge
 from collectors.base import collect_result
@@ -268,10 +269,12 @@ def run_check():
     github_status = "OK"
     trampos_status = "OK"
     geekhunter_status = "OK"
+    candidate_audit_collectors = []
 
     if durable:
         try:
             manual_col = ManualCollector(HTTP, store)
+            candidate_audit_collectors.append(manual_col)
             manual_result = collect_result(manual_col)
             discovered_manual, manual_status = manual_result.jobs, manual_result.status
             for attempt in manual_col.collection_attempts:
@@ -288,6 +291,7 @@ def run_check():
     if geekhunter_configs and not manual_only:
         for cfg in geekhunter_configs:
             gh_col = GeekHunterCollector(HTTP, cfg.get('keywords'), cfg.get('exclude_keywords'), cfg.get('max_jobs', 30))
+            candidate_audit_collectors.append(gh_col)
             result = collect_result(gh_col)
             discovered_manual.extend(result.jobs)
             if result.status != 'OK':
@@ -309,6 +313,7 @@ def run_check():
                 max_age_hours=config.get("gupy_max_age_hours", 72),
                 require_publication_date=config.get("gupy_require_publication_date", True),
             )
+            candidate_audit_collectors.append(gupy_col)
             result = collect_result(gupy_col)
             discovered_gupy, gupy_status = result.jobs, result.status
             gupy_query_stats = gupy_col.query_stats
@@ -368,6 +373,7 @@ def run_check():
                         slot=int(time.time() // (max(1, int(config.get("check_interval_minutes", 60))) * 60)),
                     )
                     li_col = LinkedInCollector(HTTP, linkedin_searches)
+                    candidate_audit_collectors.append(li_col)
                     result = collect_result(li_col)
                     discovered_linkedin, linkedin_status = result.jobs, result.status
                     linkedin_query_stats = li_col.query_stats
@@ -395,6 +401,7 @@ def run_check():
                 resolve_urls=config.get("resolve_rss_urls", False),
                 min_description_chars=config.get("rss_min_description_chars", 0),
             )
+            candidate_audit_collectors.append(rss_col)
             result = collect_result(rss_col)
             discovered_rss, rss_status = result.jobs, result.status
             for attempt in rss_col.collection_attempts:
@@ -420,6 +427,7 @@ def run_check():
                     fallback_lookback_days=cfg.get("fallback_lookback_days", 3),
                     strict_freshness=cfg.get("strict_freshness", True),
                 )
+                candidate_audit_collectors.append(gh_col)
                 result = collect_result(gh_col)
                 discovered_github.extend(result.jobs)
                 if result.status != 'OK':
@@ -443,6 +451,7 @@ def run_check():
                     exclude_keywords=cfg.get("exclude_keywords"),
                     max_pages=cfg.get("max_pages", 1)
                 )
+                candidate_audit_collectors.append(t_col)
                 result = collect_result(t_col)
                 discovered_trampos.extend(result.jobs)
                 if result.status != 'OK':
@@ -457,6 +466,7 @@ def run_check():
             'status': trampos_status, 'discovered': len(discovered_trampos)
         }} )
 
+    persist_rejections(candidate_audit_collectors, store, cycle_id)
     discovered_jobs = discovered_manual + discovered_gupy + discovered_linkedin + discovered_rss + discovered_github + discovered_trampos
 
     # 3. Deduplicação e Fusão de Múltiplas Fontes

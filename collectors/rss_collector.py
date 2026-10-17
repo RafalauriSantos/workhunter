@@ -264,17 +264,39 @@ class RssCollector(BaseCollector):
                 # Filtro anti-ruído de páginas agregadoras (SPEC-008)
                 noise_score, _ = calculate_noise_score(title_clean, item["link"])
                 if noise_score >= 2:
-                    # Descarte de páginas de contagem de vagas agregadas
+                    self.record_candidate_rejection(
+                        'rss', item.get('id'), title_clean, 'source_filter',
+                        'Título/link identificado como página agregadora, não como vaga individual',
+                        query={'feed': cfg.get('description', ''), 'url': cfg.get('url', '')},
+                        url=item.get('link', ''), published_at=item.get('raw_date', ''),
+                    )
                     continue
 
                 if not self._matches_filters(title_lower, cfg):
+                    excluded = [word for word in cfg.get('exclude_keywords', [])
+                                if word.lower() in title_lower]
+                    matched = [word for word in cfg.get('keywords', [])
+                               if word.lower() in title_lower]
+                    reason = (f"Título contém termo excluído: {', '.join(excluded)}" if excluded
+                              else 'Título não corresponde às palavras-chave configuradas')
+                    self.record_candidate_rejection(
+                        'rss', item.get('id'), title_clean, 'source_filter', reason,
+                        query={'feed': cfg.get('description', ''), 'url': cfg.get('url', ''),
+                               'matched_keywords': matched},
+                        url=item.get('link', ''), published_at=item.get('raw_date', ''),
+                    )
                     continue
 
                 # Parse temporal e filtro de recência (SPEC-008)
                 dt = parse_feed_datetime(item.get("raw_date", ""))
                 freshness, _ = classify_freshness(dt, max_age_hours=cfg.get("max_age_hours", 72))
                 if freshness == "STALE":
-                    # Descarta se tiver certeza comprovada de que a vaga tem mais de 72h
+                    self.record_candidate_rejection(
+                        'rss', item.get('id'), title_clean, 'freshness_filter',
+                        f"Anúncio fora da janela de {cfg.get('max_age_hours', 72)} horas",
+                        query={'feed': cfg.get('description', ''), 'url': cfg.get('url', '')},
+                        url=item.get('link', ''), published_at=dt.isoformat() if dt else '',
+                    )
                     continue
 
                 raw_link = item["link"]
@@ -308,6 +330,13 @@ class RssCollector(BaseCollector):
                     and not cfg.get("official")
                     and len(job.description.strip()) < self.min_description_chars
                 ):
+                    self.record_candidate_rejection(
+                        'rss', item.get('id'), title_clean, 'evidence_filter',
+                        f"Descrição curta: {len(job.description.strip())} caracteres; mínimo {self.min_description_chars}",
+                        query={'feed': cfg.get('description', ''), 'url': cfg.get('url', '')},
+                        url=canonical_link or raw_link,
+                        published_at=job.published_at,
+                    )
                     continue
                 discovered.append(job)
 

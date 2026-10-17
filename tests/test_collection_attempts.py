@@ -1,6 +1,8 @@
+import json
 from storage.sqlite_store import SQLiteStore
 import requests
 from collectors.gupy_collector import GupyCollector
+from models.job import Job
 
 
 class _EmptyResponse:
@@ -57,3 +59,52 @@ def test_collection_attempt_serializes_structured_query(tmp_path):
     })
     with store.connect() as db:
         assert db.execute('SELECT query FROM collection_attempts').fetchone()[0] == '{"limit": 20, "term": "python"}'
+
+
+def test_remember_job_preserves_original_first_seen_timestamp(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    first = Job(title='Junior Developer', company='Acme', workplace_type='remote',
+                first_seen='2026-10-01T10:00:00+00:00')
+    first.add_source('gupy', 'job-1', 'https://acme.gupy.io/jobs/1')
+    store.remember_job(first)
+
+    seen_again = Job(title='Junior Developer', company='Acme', workplace_type='remote',
+                     first_seen='2026-10-02T10:00:00+00:00')
+    seen_again.add_source('gupy', 'job-1', 'https://acme.gupy.io/jobs/1')
+    store.remember_job(seen_again)
+
+    with store.connect() as db:
+        payload = json.loads(db.execute(
+            'SELECT payload FROM jobs WHERE source=? AND external_id=?', ('gupy', 'job-1')
+        ).fetchone()[0])
+    assert payload['first_seen'] == '2026-10-01T10:00:00+00:00'
+
+
+def test_candidate_filter_rejection_is_persisted_with_query_and_reason(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    store.record_candidate_rejection({
+        'cycle_id': 'cycle-123', 'source': 'rss', 'source_job_id': 'item-123',
+        'title': 'Senior Platform Engineer', 'query': {'url': 'https://feed.example/rss'},
+        'stage': 'source_filter', 'reason': 'Título excluído: senior',
+        'published_at': '2026-10-17T09:00:00+00:00',
+    })
+
+    with store.connect() as db:
+        row = db.execute('''SELECT cycle_id,source,source_job_id,title,query,stage,reason,published_at
+            FROM candidate_rejections''').fetchone()
+    assert row[:4] == ('cycle-123', 'rss', 'item-123', 'Senior Platform Engineer')
+    assert json.loads(row[4]) == {'url': 'https://feed.example/rss'}
+    assert row[5:] == ('source_filter', 'Título excluído: senior', '2026-10-17T09:00:00+00:00')
+
+
+def test_candidate_rejections_are_written_as_a_batch(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    store.record_candidate_rejections([
+        {'cycle_id': 'cycle-1', 'source': 'rss', 'source_job_id': 'a',
+         'stage': 'source_filter', 'reason': 'reason-a'},
+        {'cycle_id': 'cycle-1', 'source': 'gupy', 'source_job_id': 'b',
+         'stage': 'source_parse', 'reason': 'reason-b'},
+    ])
+    with store.connect() as db:
+        rows = db.execute('SELECT source,source_job_id,reason FROM candidate_rejections ORDER BY id').fetchall()
+    assert rows == [('rss', 'a', 'reason-a'), ('gupy', 'b', 'reason-b')]

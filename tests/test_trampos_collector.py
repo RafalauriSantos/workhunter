@@ -64,3 +64,6 @@ def test_trampos_collector_maps_api_response_to_job(monkeypatch):
     assert "trampos" in job.sources
     assert job.canonical_url == "https://trampos.co/oportunidades/1001"
     assert job.evidence_level == "HIGH_EVIDENCE"
+    rejection = next(item for item in collector.rejected_candidates if item['source_job_id'] == '1002')
+    assert rejection['stage'] == 'source_filter'
+    assert 'termo excluído' in rejection['reason']

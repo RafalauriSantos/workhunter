@@ -135,3 +135,7 @@ def test_gupy_collector_can_require_publication_date():
 
     assert collector.collect() == []
     assert "MISSING_PUBLICATION_DATE" in collector.query_stats[0]["warnings"]
+    rejection = collector.rejected_candidates[0]
+    assert rejection['source_job_id'] == '42'
+    assert rejection['stage'] == 'freshness_filter'
+    assert 'data de publicação' in rejection['reason']

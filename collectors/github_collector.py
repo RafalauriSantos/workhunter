@@ -164,6 +164,12 @@ class GithubIssuesCollector(BaseCollector):
                         repo_stats["issues_seen"] += 1
                         if "pull_request" in issue:
                             self.stats["pull_requests_skipped"] += 1
+                            self.record_candidate_rejection(
+                                'github', issue.get('id'), issue.get('title', ''), 'source_filter',
+                                'Item é um pull request, não uma publicação de vaga',
+                                query={'repo': repo}, url=issue.get('html_url', ''),
+                                published_at=issue.get('created_at', ''),
+                            )
                             continue
 
                         created_at = issue.get("created_at")
@@ -182,12 +188,24 @@ class GithubIssuesCollector(BaseCollector):
                         if self.strict_freshness and created is None:
                             self.stats["stale_skipped"] += 1
                             repo_stats["stale"] += 1
+                            self.record_candidate_rejection(
+                                'github', issue.get('id'), issue.get('title', ''), 'freshness_filter',
+                                'Data original de criação ausente ou inválida; atualização recente não prova que a vaga é nova',
+                                query={'repo': repo}, url=issue.get('html_url', ''),
+                                published_at=created_at or '',
+                            )
                             continue
                         if created is None:
                             created = fallback_cutoff
                         if created < primary_cutoff:
                             self.stats["stale_skipped"] += 1
                             repo_stats["stale"] += 1
+                            self.record_candidate_rejection(
+                                'github', issue.get('id'), issue.get('title', ''), 'freshness_filter',
+                                f"Publicação anterior à janela de {self.lookback_days} dias",
+                                query={'repo': repo}, url=issue.get('html_url', ''),
+                                published_at=created.isoformat(),
+                            )
                             continue
 
                         raw_title = issue.get("title", "")
@@ -201,6 +219,16 @@ class GithubIssuesCollector(BaseCollector):
                         if not self._matches_filters(search_context):
                             self.stats["filtered_skipped"] += 1
                             repo_stats["filtered"] += 1
+                            excluded = [word for word in self.exclude_keywords if word in search_context.lower()]
+                            matched = [word for word in self.keywords if word in search_context.lower()]
+                            reason = (f"Publicação contém termo excluído: {', '.join(excluded)}" if excluded
+                                      else 'Publicação não corresponde às palavras-chave configuradas')
+                            self.record_candidate_rejection(
+                                'github', issue.get('id'), raw_title, 'source_filter', reason,
+                                query={'repo': repo, 'keywords': self.keywords,
+                                       'exclude_keywords': self.exclude_keywords, 'matched_keywords': matched},
+                                url=issue.get('html_url', ''), published_at=created.isoformat() if created else '',
+                            )
                             continue
 
                         title_clean = normalize_title(raw_title)

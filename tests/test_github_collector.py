@@ -75,6 +75,10 @@ class TestGithubIssuesCollector:
         assert job_goomer.company == "Goomer"
         assert "github" in job_goomer.sources
         assert job_goomer.sources["github"].url == "https://github.com/frontendbr/vagas/issues/101"
+        rejected_ids = {item['source_job_id'] for item in collector.rejected_candidates}
+        assert {'102', '103'} <= rejected_ids
+        rejection = next(item for item in collector.rejected_candidates if item['source_job_id'] == '102')
+        assert rejection['reason'] == 'Item é um pull request, não uma publicação de vaga'
 
     def test_auth_headers_with_github_token(self):
         mock_http = MagicMock()
