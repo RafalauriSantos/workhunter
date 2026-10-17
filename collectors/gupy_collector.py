@@ -117,6 +117,7 @@ class GupyCollector(BaseCollector):
                 self.record_attempt('gupy', 'detail', started, query={'job_id': job_id},
                                     http_status=response.status_code, error_type=f'HTTP_{response.status_code}')
                 return {}
+            response.encoding = 'utf-8'
             for line in response.text.splitlines():
                 if line.startswith("data:"):
                     payload = json.loads(line[5:].strip())

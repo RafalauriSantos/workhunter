@@ -116,6 +116,32 @@ def test_gupy_detail_request_sends_numeric_job_id_to_mcp():
     assert isinstance(arguments['id'], int)
 
 
+def test_gupy_detail_response_is_decoded_as_utf8():
+    class Response:
+        status_code = 200
+        encoding = 'ISO-8859-1'
+
+        def __init__(self):
+            payload = {'result': {'content': [{'text': json.dumps({
+                'data': {'id': 12601484, 'name': 'Desenvolvedor Júnior'}
+            }, ensure_ascii=False)}]}}
+            self.content = ('data: ' + json.dumps(payload, ensure_ascii=False)).encode('utf-8')
+
+        @property
+        def text(self):
+            return self.content.decode(self.encoding)
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    collector = GupyCollector(Session(), [], detail_limit=1)
+
+    detail = collector._get_detail('12601484')
+
+    assert detail['name'] == 'Desenvolvedor Júnior'
+
+
 def test_gupy_enriches_missing_publication_date_from_flat_detail_payload():
     from datetime import datetime, timedelta, timezone
 
