@@ -21,7 +21,7 @@ def audit_job(store, source, native_id):
         ).fetchone()
         attempt_rows = db.execute('''SELECT cycle_id,operation,query,started,finished,
             result_count,native_ids,http_status,error_type,timed_out,reason
-            FROM collection_attempts WHERE source=? ORDER BY id''', (source,)).fetchall()
+            FROM collection_attempts WHERE source=? AND operation='search' ORDER BY id''', (source,)).fetchall()
         rejection_rows = db.execute('''SELECT cycle_id,title,query,url,published_at,
             stage,reason,created_at FROM candidate_rejections
             WHERE source=? AND source_job_id=? ORDER BY id''', (source, native_id)).fetchall()

@@ -12,6 +12,11 @@ def test_audit_job_traces_search_to_capture_and_decision(tmp_path):
         'started': '2026-10-17T10:00:00+00:00', 'finished': '2026-10-17T10:00:02+00:00',
         'http_status': 200, 'result_count': 2, 'native_ids': ['4473616899'],
     })
+    store.record_collection_attempt({
+        'cycle_id': 'cycle-1', 'source': 'linkedin', 'operation': 'detail',
+        'query': {'job_id': '4473616899'}, 'http_status': 200,
+        'result_count': 1, 'native_ids': ['4473616899'],
+    })
     payload = {
         'title': 'Junior Frontend Developer', 'company': 'Jungle Gaming',
         'published_at': '2026-10-17T09:50:00+00:00',
@@ -31,6 +36,7 @@ def test_audit_job_traces_search_to_capture_and_decision(tmp_path):
     assert result['published_at'] == '2026-10-17T09:50:00+00:00'
     assert result['first_seen'] == '2026-10-17T10:00:02+00:00'
     assert result['search_attempts'][0]['query']['query_id'] == 'wide-v1'
+    assert len(result['search_attempts']) == 1
     assert result['decision']['reason'] == 'Requisito eliminatório'
     assert result['decision']['score'] == 68
 
