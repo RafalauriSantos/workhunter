@@ -147,11 +147,10 @@ class LinkedInCollector(BaseCollector):
 
                 resp.encoding = "utf-8"
                 cards = re.findall(r'<li[^>]*>(.*?)</li>', resp.text, re.DOTALL)
-                page_ids = re.findall(
-                    r"data-entity-urn\s*=\s*[\"']urn:li:jobPosting:(\d+)[\"']",
-                    resp.text,
-                    re.IGNORECASE,
-                )
+                page_ids = list(dict.fromkeys(
+                    job_id for card in cards
+                    if (job_id := self._extract_job_id(card))
+                ))
                 audit_query = {**params}
                 if search_cfg.get("query_id"):
                     audit_query["query_id"] = search_cfg["query_id"]
@@ -163,7 +162,6 @@ class LinkedInCollector(BaseCollector):
 
                 page_new_jobs = 0
                 for card_index, card in enumerate(cards):
-                    urn_match = re.search(r'data-entity-urn=\"urn:li:jobPosting:(\d+)\"', card)
                     title_match = re.search(r'<h3[^>]*class=\"[^\"]*base-search-card__title[^\"]*\"[^>]*>\s*([^<]+)\s*</h3>', card)
                     company_match = re.search(r'<h4[^>]*class=\"[^\"]*base-search-card__subtitle[^\"]*\"[^>]*>.*?<a[^>]*>\s*([^<]+)\s*</a>', card, re.DOTALL)
                     link_match = re.search(r'<a[^>]*class=\"[^\"]*base-card__full-link[^\"]*\"[^>]*href=\"([^\"]+)\"', card)
@@ -183,7 +181,7 @@ class LinkedInCollector(BaseCollector):
                         )
                         self.record_candidate_rejection(
                             'linkedin',
-                            rejected_id_match.group(1) if rejected_id_match else f'card-{page}-{card_index}',
+                            self._extract_job_id(card, link_match.group(1) if link_match else '') or f'card-{page}-{card_index}',
                             title_match.group(1).strip() if title_match else '',
                             'source_parse',
                             'Card sem título ou link de vaga reconhecível',
@@ -197,7 +195,14 @@ class LinkedInCollector(BaseCollector):
                     title = normalize_title(raw_title)
                     company = company_match.group(1).strip() if company_match else "LinkedIn"
                     raw_link = link_match.group(1).split("?")[0]
-                    job_id = urn_match.group(1) if urn_match else raw_link.split("-")[-1]
+                    job_id = self._extract_job_id(card, raw_link)
+                    if not job_id:
+                        self.record_candidate_rejection(
+                            'linkedin', f'card-{page}-{card_index}', title,
+                            'source_parse', 'Link do cartão não contém um ID de vaga reconhecível',
+                            query=audit_query, url=raw_link, published_at=published_at,
+                        )
+                        continue
                     if job_id in seen_ids:
                         continue
                     seen_ids.add(job_id)
@@ -246,6 +251,23 @@ class LinkedInCollector(BaseCollector):
         stats["parsed_jobs"] = len(jobs)
         self.query_stats.append(stats)
         return jobs
+
+    @staticmethod
+    def _extract_job_id(card: str, url: str = '') -> str:
+        patterns = (
+            r"data-entity-urn\s*=\s*[\"']urn:li:jobPosting:(\d+)[\"']",
+            r"(?:currentJobId|jobPostingId|jobId)=(\d+)",
+            r"/jobs/view/(?:[^/?#]*-)?(\d+)(?:[/?#]|$)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, card, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        for pattern in patterns[1:]:
+            match = re.search(pattern, url, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ''
 
     def collect(self) -> List[Job]:
         discovered: List[Job] = []

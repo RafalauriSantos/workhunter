@@ -104,6 +104,27 @@ def test_linkedin_search_attempt_records_native_job_ids_and_query_id(monkeypatch
     assert 'Card sem título' in parse_rejection['reason']
 
 
+def test_linkedin_search_attempt_recovers_ids_from_job_urls_without_urn(monkeypatch):
+    session = requests.Session()
+    html = '''<ul>
+    <li><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/4473616899/"></a>
+        <h3 class="base-search-card__title">Junior Frontend Developer</h3></li>
+    <li><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/frontend-engineer-at-company-4473616900?trackingId=x"></a>
+        <h3 class="base-search-card__title">Frontend Engineer</h3></li>
+    </ul>'''
+    monkeypatch.setattr(session, 'get', lambda *args, **kwargs: MockResponse(html, 200))
+
+    collector = LinkedInCollector(session, [{
+        'query': 'frontend developer', 'query_id': 'front-end-wide',
+    }])
+    jobs = collector.collect()
+
+    assert [job.sources['linkedin'].source_job_id for job in jobs] == ['4473616899', '4473616900']
+    attempt = collector.collection_attempts[0]
+    assert attempt['native_ids'] == ['4473616899', '4473616900']
+    assert attempt['query']['query_id'] == 'front-end-wide'
+
+
 def test_linkedin_collector_handles_http_errors_gracefully(monkeypatch):
     session = requests.Session()
     # Simula status 429 Too Many Requests ou 500 do LinkedIn
