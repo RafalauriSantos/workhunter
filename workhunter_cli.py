@@ -26,6 +26,9 @@ def audit_job(store, source, native_id):
             stage,reason,created_at FROM candidate_rejections
             WHERE source=? AND source_job_id=? ORDER BY id''', (source, native_id)).fetchall()
         event_rows = db.execute("SELECT payload FROM events WHERE kind='decision'").fetchall()
+        pipeline_skip_rows = db.execute(
+            "SELECT payload FROM events WHERE kind='pipeline_skip'"
+        ).fetchall()
         outbox_rows = db.execute('SELECT fingerprint,payload,status,attempts,retry_at FROM outbox').fetchall()
         channel_rows = db.execute('SELECT fingerprint,channel,status,created FROM channel_attempts').fetchall()
         state_row = db.execute("SELECT value FROM metadata WHERE key='state'").fetchone()
@@ -73,6 +76,26 @@ def audit_job(store, source, native_id):
             decisions.append(decision)
 
     payload = json.loads(job_row['payload']) if job_row else None
+    payload_analysis = (payload or {}).get('analysis') or {}
+    fingerprint = (payload_analysis.get('semantic_fingerprint')
+                   or (payload or {}).get('identity_fingerprint'))
+    pipeline_skips = []
+    for row in pipeline_skip_rows:
+        try:
+            item = json.loads(row['payload'])
+        except (TypeError, ValueError):
+            continue
+        source_ids = [str(value) for value in item.get('source_ids', [])]
+        if (namespaced_id in source_ids or native_id in source_ids
+                or (fingerprint and item.get('fingerprint') == fingerprint)):
+            pipeline_skips.append(item)
+
+    legacy_seen_state = bool(
+        (fingerprint and fingerprint in state.get('seen_fingerprints', []))
+        or native_id in [str(value) for value in state.get('seen_ids', [])]
+        or namespaced_id in [str(value) for value in state.get('seen_ids', [])]
+    )
+
     matched_outbox = []
     matched_fingerprints = set()
     for row in outbox_rows:
@@ -109,7 +132,11 @@ def audit_job(store, source, native_id):
         }
     else:
         decision_summary = None
-        classification = ('collected_no_decision' if payload else
+        classification = ('skipped_as_already_seen' if pipeline_skips and
+                          pipeline_skips[-1].get('stage') == 'deduplication' else
+                          'delivery_retry_deferred' if pipeline_skips else
+                          'seen_without_decision_evidence' if payload and legacy_seen_state else
+                          'collected_no_decision' if payload else
                           'source_filtered' if rejections else
                           'found_in_search_not_persisted' if search_attempts else
                           'no_collection_evidence_in_retained_audit')
@@ -121,6 +148,8 @@ def audit_job(store, source, native_id):
         'published_at': (payload or {}).get('published_at') or (rejections[-1]['published_at'] if rejections else None),
         'first_seen': source_info.get('first_seen') or (payload or {}).get('first_seen'),
         'search_attempts': search_attempts, 'source_rejections': rejections,
+        'pipeline_skips': pipeline_skips,
+        'legacy_seen_state': legacy_seen_state,
         'stored_job': payload,
         'decision': decision_summary,
         'outbox': matched_outbox, 'channel_attempts': channels,

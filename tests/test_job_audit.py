@@ -2,6 +2,8 @@ import json
 
 from storage.sqlite_store import SQLiteStore
 from workhunter_cli import audit_job, main
+from monitor import record_pipeline_skip
+from models.job import Job
 
 
 def test_audit_job_traces_search_to_capture_and_decision(tmp_path):
@@ -63,6 +65,49 @@ def test_audit_job_reports_no_evidence_without_claiming_source_miss(tmp_path):
     result = audit_job(store, 'linkedin', '99999')
 
     assert result['classification'] == 'no_collection_evidence_in_retained_audit'
+
+
+def test_audit_job_explains_a_persisted_already_seen_skip(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    job = Job('Junior Frontend Developer', 'Example', 'remote')
+    job.add_source('linkedin', '88888', 'https://www.linkedin.com/jobs/view/88888/')
+    job.analysis['semantic_fingerprint'] = 'semantic-fp'
+    payload = {
+        'title': 'Junior Frontend Developer', 'company': 'Example',
+        'analysis': {'semantic_fingerprint': 'semantic-fp'},
+        'sources': {'linkedin': {'source_name': 'linkedin', 'source_job_id': '88888',
+                                 'url': 'https://www.linkedin.com/jobs/view/88888/'}},
+    }
+    with store.connect() as db:
+        db.execute('INSERT INTO jobs(source,external_id,payload) VALUES (?,?,?)',
+                   ('linkedin', '88888', json.dumps(payload)))
+    record_pipeline_skip(store, job, 'cycle-skip', 'semantic-fp', 'deduplication',
+                         'Já estava marcado como visto')
+
+    result = audit_job(store, 'linkedin', '88888')
+
+    assert result['classification'] == 'skipped_as_already_seen'
+    assert result['pipeline_skips'][0]['reason'] == 'Já estava marcado como visto'
+
+
+def test_audit_job_labels_legacy_seen_state_without_inventing_a_reason(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    payload = {
+        'title': 'Junior Frontend Developer', 'company': 'Example',
+        'analysis': {'semantic_fingerprint': 'legacy-fp'},
+        'sources': {'linkedin': {'source_job_id': '99988'}},
+    }
+    with store.connect() as db:
+        db.execute('INSERT INTO jobs(source,external_id,payload) VALUES (?,?,?)',
+                   ('linkedin', '99988', json.dumps(payload)))
+    store.state['seen_fingerprints'].append('legacy-fp')
+    store.save()
+
+    result = audit_job(store, 'linkedin', '99988')
+
+    assert result['classification'] == 'seen_without_decision_evidence'
+    assert result['legacy_seen_state'] is True
+    assert result['pipeline_skips'] == []
 
 
 def test_audit_job_connects_delivery_attempt_to_the_vacancy(tmp_path):

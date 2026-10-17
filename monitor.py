@@ -136,6 +136,24 @@ def write_cycle_progress(cycle_id, phase, sources=None, funnel=None, error=None)
         print(f'Checkpoint de ciclo indisponível: {type(exc).__name__}')
 
 
+def record_pipeline_skip(store, job, cycle_id, fingerprint, stage, reason):
+    """Persist why a stored candidate was skipped before scoring or delivery."""
+    recorder = getattr(store, 'event', None)
+    if not callable(recorder):
+        return
+    recorder('pipeline_skip', {
+        'cycle_id': cycle_id,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'source_ids': [f'{name}:{item.source_job_id}'
+                       for name, item in job.sources.items()],
+        'fingerprint': fingerprint,
+        'title': job.title,
+        'company': job.company,
+        'stage': stage,
+        'reason': reason,
+    })
+
+
 def check_heartbeat(config: dict, store: StateStore, notifier: TelegramNotifier):
     """Respeita a frequência configurada sem repetir mensagens de status."""
     hb_cfg = config.get("heartbeat", {})
@@ -501,9 +519,28 @@ def run_check():
         # Se já foi notificada anteriormente, ignora
         if store.is_seen(fp, source_ids[0] if source_ids else ""):
             discarded_seen += 1
+            record_pipeline_skip(
+                store, job, cycle_id, fp, 'deduplication',
+                'Fingerprint ou ID da vaga já constava como visto antes deste ciclo; '
+                'a trilha histórica anterior pode não estar disponível.',
+            )
             continue
         if not store.delivery_retry_allowed(fp):
             discarded_seen += 1
+            delivery = store.get_delivery(fp)
+            status = delivery.get('status', 'UNKNOWN')
+            attempts = delivery.get('attempts', 0)
+            retry_at = delivery.get('next_retry_at')
+            if status == 'DELIVERED':
+                reason = 'A entrega já foi confirmada anteriormente.'
+            elif attempts >= 3:
+                reason = f'Limite de tentativas de entrega alcançado ({attempts}).'
+            else:
+                reason = f'Nova tentativa ainda não permitida; estado={status}, tentativas={attempts}'
+                if retry_at:
+                    reason += f', próxima tentativa após {retry_at}'
+                reason += '.'
+            record_pipeline_skip(store, job, cycle_id, fp, 'delivery_retry', reason)
             continue
 
         # Auditoria individual da decisão
