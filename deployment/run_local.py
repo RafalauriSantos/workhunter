@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 NETWORK_PROBE_HOSTS = ('candidates.mcp.api.gupy.io', 'api.telegram.org')
+SCHEDULER_CHECK_INTERVAL_SECONDS = 60
 
 
 def network_is_ready():
@@ -128,7 +129,7 @@ def main():
         if '--loop' in arguments:
             arguments = [arg for arg in arguments if arg != '--loop'] or ['--due']
             timeout_seconds = int(os.environ.get('JOB_FINDER_CYCLE_TIMEOUT_SECONDS', '240'))
-            logger.info('Local runner started; checking every 5 minutes; cycle timeout=%ss', timeout_seconds)
+            logger.info('Local runner started; checking every minute; cycle timeout=%ss', timeout_seconds)
             while True:
                 started = time.monotonic()
                 try:
@@ -158,7 +159,7 @@ def main():
                     # The watchdog must stay alive after one bad cycle; the next
                     # five-minute check can recover transient source/runtime errors.
                     logger.error('Cycle failed: %s; retrying on next check', type(exc).__name__)
-                time.sleep(300)
+                time.sleep(SCHEDULER_CHECK_INTERVAL_SECONDS)
         else:
             run(monitor, arguments)
     except Exception as exc:
