@@ -1,0 +1,39 @@
+{
+  "observed_at": "2026-10-17",
+  "cases": [
+    {
+      "case_id": "github-strider-fast-capture",
+      "source": "github",
+      "native_id": "5746308554",
+      "title": "[Remoto] Full-stack Engineer React.js • UX Design • Node.js (Strider)",
+      "query": {"repo": "backend-br/vagas"},
+      "published_at": "2026-10-07T14:02:31+00:00",
+      "captured_at": "2026-10-07T14:05:44.942938+00:00",
+      "delivered_at": "2026-10-07T14:05:58.016237+00:00",
+      "expected_capture_delay_minutes": 3.2,
+      "expected_classification": "delivered"
+    },
+    {
+      "case_id": "gupy-softexpert-late-source-discovery",
+      "source": "gupy",
+      "native_id": "12628096",
+      "title": "Desenvolvedor(a) Full Stack Junior (PHP/React)",
+      "query": {"term": "Full Stack Junior"},
+      "published_at": "2026-09-29T13:59:20.506Z",
+      "captured_at": "2026-10-03T23:16:52.575989+00:00",
+      "delivered_at": "2026-10-05T17:30:35.022426+00:00",
+      "expected_capture_delay_minutes": 6317.5,
+      "expected_classification": "delivered"
+    },
+    {
+      "case_id": "linkedin-4473616899-legacy-untraceable",
+      "source": "linkedin",
+      "native_id": "4473616899",
+      "title": "Desenvolvedor Front-end Junior | Remoto",
+      "legacy_first_seen": "2026-10-05T15:02:15.608620",
+      "expected_classification": "seen_without_decision_evidence",
+      "collection_attempts": 0,
+      "root_cause": "unknown_from_retained_evidence"
+    }
+  ]
+}

@@ -50,7 +50,16 @@ def test_gupy_collector_records_query_parameters_and_result_count():
         "parameters": {"term": "Java", "limit": 20},
         "results": 1,
         "status": "OK",
+        "detail_candidates": 1,
+        "detail_attempts": 1,
+        "detail_successes": 0,
+        "detail_dates_found": 0,
+        "detail_dates_missing": 0,
+        "unknown_date_rejections": 0,
+        "detail_cache_hits": 0,
+        "detail_limit_skips": 0,
     }]
+    assert collector.detail_cache == {}
 
 
 def test_gupy_collector_distinguishes_http_failure_from_empty_result():
@@ -182,6 +191,11 @@ def test_gupy_enriches_missing_publication_date_from_flat_detail_payload():
 
     assert len(jobs) == 1
     assert jobs[0].published_at == published_at
+    assert collector.query_stats[0]["detail_candidates"] == 1
+    assert collector.query_stats[0]["detail_attempts"] == 1
+    assert collector.query_stats[0]["detail_successes"] == 1
+    assert collector.query_stats[0]["detail_dates_found"] == 1
+    assert collector.collection_attempts[-1]['reason'] == 'publication_date_found'
     detail_arguments = session.calls[1]['json']['params']['arguments']
     assert detail_arguments == {'id': 10939233}
 
@@ -263,6 +277,8 @@ def test_gupy_collector_can_require_publication_date():
 
     assert collector.collect() == []
     assert "MISSING_PUBLICATION_DATE" in collector.query_stats[0]["warnings"]
+    assert collector.query_stats[0]["detail_dates_missing"] == 1
+    assert collector.query_stats[0]["unknown_date_rejections"] == 1
     rejection = collector.rejected_candidates[0]
     assert rejection['source_job_id'] == '42'
     assert rejection['stage'] == 'freshness_filter'

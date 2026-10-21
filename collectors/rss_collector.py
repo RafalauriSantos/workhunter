@@ -3,7 +3,9 @@ import email.utils
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlsplit
 import requests
 from datetime import datetime, timezone
 from html import unescape
@@ -199,6 +201,10 @@ class RssCollector(BaseCollector):
             if owns_session:
                 session.close()
 
+    def _fetch_direct_host_group(self, configs):
+        """Avoid concurrent requests to the same employer-owned feed host."""
+        return [(cfg, self._fetch_feed(cfg["url"])) for cfg in configs]
+
     def _matches_filters(self, title_lower: str, config: Dict[str, Any]) -> bool:
         """Aplica keyword/exclude_keyword filters do config ao título do item RSS."""
         keywords = [k.lower() for k in config.get("keywords", [])]
@@ -248,21 +254,40 @@ class RssCollector(BaseCollector):
     def collect(self) -> List[Job]:
         discovered: List[Job] = []
         feed_configs = [cfg for cfg in self.configs if cfg.get("url", "")]
-        worker_count = min(self.MAX_CONCURRENT_FEEDS, len(feed_configs))
-        if worker_count:
-            # Feed servers are independent. A slow vendor feed must not delay
-            # every later RSS query, while the small worker cap keeps request
-            # pressure bounded.
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rss-feed") as executor:
-                feed_results = executor.map(
-                    self._fetch_feed,
-                    (cfg["url"] for cfg in feed_configs),
-                )
-                feed_items = list(feed_results)
-        else:
-            feed_items = []
+        # Consult employer-owned feeds before Google News queries. Feeds from
+        # one direct host are serialized: the GFT endpoint repeatedly timed
+        # out when its four configured queries were sent concurrently.
+        direct_configs = [cfg for cfg in feed_configs
+                          if "news.google.com" not in cfg["url"].lower()]
+        aggregator_configs = [cfg for cfg in feed_configs
+                              if "news.google.com" in cfg["url"].lower()]
+        ordered_configs = direct_configs + aggregator_configs
+        feed_items_by_config = {}
+        direct_by_host = defaultdict(list)
+        for cfg in direct_configs:
+            host = urlsplit(cfg["url"]).netloc.lower()
+            direct_by_host[host].append(cfg)
+        host_groups = list(direct_by_host.values())
+        if host_groups:
+            worker_count = min(self.MAX_CONCURRENT_FEEDS, len(host_groups))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rss-direct-host") as executor:
+                for host_results in executor.map(self._fetch_direct_host_group, host_groups):
+                    for cfg, items in host_results:
+                        feed_items_by_config[id(cfg)] = items
 
-        for cfg, raw_items in zip(feed_configs, feed_items):
+        # Aggregators remain bounded-parallel to preserve cycle time; direct
+        # sources have already completed before their requests begin.
+        if aggregator_configs:
+            worker_count = min(self.MAX_CONCURRENT_FEEDS, len(aggregator_configs))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rss-aggregator") as executor:
+                aggregator_results = executor.map(
+                    self._fetch_feed, (cfg["url"] for cfg in aggregator_configs)
+                )
+                for cfg, items in zip(aggregator_configs, aggregator_results):
+                    feed_items_by_config[id(cfg)] = items
+
+        for cfg in ordered_configs:
+            raw_items = feed_items_by_config.get(id(cfg), [])
             company = cfg.get("company", cfg.get("description", "RSS"))
 
             for item in raw_items:

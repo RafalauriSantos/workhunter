@@ -17,6 +17,14 @@ O processo normal usa `check_interval_minutes` do `config.json`. O limite de uma
 - `cycle_health.json`: resumo da última rodada, com duração, saúde das fontes,
   funil de descarte e entregas; é regenerado ao final de cada ciclo bem-sucedido.
 
+O coletor público do LinkedIn continua limitado a uma busca por janela de seis
+horas. `linkedin_detail_enrichment_enabled` habilita a tentativa de obter a
+descrição apenas para cartões de vagas de software com sinais de aderência e
+evidência incompleta; `linkedin_detail_enrichment_limit` define o teto total de
+detalhes por ciclo (configurado em 2). Vagas sênior e títulos fora do escopo não
+consomem esse orçamento. Respostas HTTP 429 interrompem novas tentativas e
+acionam o cooldown persistente da fonte.
+
 ### Fallback de entrega
 
 O Telegram é o canal primário. Quando o envio retorna falha, o monitor tenta
@@ -64,3 +72,13 @@ recebidas entram na fila e executam somente a análise manual.
 ## Métricas
 
 O relatório de cada ciclo mostra descoberta bruta, vagas únicas, duplicatas implícitas, descartes por motivo, alertas entregues, chamadas LLM, duração e saúde por fonte. Precisão e recall reais exigem feedback humano sobre relevância e candidaturas; o sistema não os inventa a partir de contagens de filtro.
+
+Use `python workhunter_cli.py audit-sources --days 7` para auditar o desempenho
+retido por fonte. O relatório separa tentativas de enriquecimento (úteis, sem
+dados, HTTP 429 e timeout) das buscas e agrupa RSS pelo hostname, incluindo
+timeouts e falhas consecutivas. Para Gupy, o resumo do ciclo informa datas
+recuperadas e datas que permaneceram desconhecidas; com exigência de data
+verificável, essas vagas são rejeitadas por recência e não entram como recentes.
+HTTP 429 ao abrir detalhes do LinkedIn pausa somente o enriquecimento por seis
+horas; as buscas permanecem ativas. HTTP 429 nas próprias buscas continua usando
+o cooldown integral da fonte.

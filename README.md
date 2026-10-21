@@ -85,6 +85,11 @@ LinkedIn coverage is intentionally bounded. The browser extension only submits
 posts that LinkedIn has loaded in the open feed. It does not bypass login,
 challenges, rate limits or access controls.
 
+The guest collector runs at most one search query per six-hour poll. It may
+enrich details for up to two likely junior-to-mid software roles when the card
+lacks useful evidence. This small per-cycle budget avoids fetching every result;
+the source cooldown still takes precedence if LinkedIn responds with HTTP 429.
+
 ## Reliability and safety
 
 Each source has isolated timeout, retry and rate-limit handling. A source

@@ -74,3 +74,55 @@ def test_rss_evidence_gate_discards_shallow_non_official_items():
     )
 
     assert collector.collect() == []
+
+
+def test_rss_fetches_direct_employer_feeds_before_google_news_aggregators():
+    collector = RssCollector(MockSession(), [
+        {"url": "https://news.google.com/rss/search?q=developer", "description": "Google News"},
+        {"url": "https://jobs.example.com/rss", "description": "Employer feed", "official": True},
+        {"url": "https://another.example.com/rss", "description": "Other direct feed"},
+    ])
+    collector.MAX_CONCURRENT_FEEDS = 1
+    requested = []
+
+    def record_fetch(url):
+        requested.append(url)
+        return []
+
+    collector._fetch_feed = record_fetch
+
+    assert collector.collect() == []
+    assert requested == [
+        "https://jobs.example.com/rss",
+        "https://another.example.com/rss",
+        "https://news.google.com/rss/search?q=developer",
+    ]
+
+
+def test_rss_serializes_requests_to_same_direct_host():
+    import threading
+    import time
+
+    configs = [
+        {"url": f"https://jobs.example.com/rss/{index}", "description": f"feed {index}"}
+        for index in range(4)
+    ]
+    collector = RssCollector(MockSession(), configs)
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def record_fetch(url):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return []
+
+    collector._fetch_feed = record_fetch
+
+    assert collector.collect() == []
+    assert max_active == 1

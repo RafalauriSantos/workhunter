@@ -126,14 +126,24 @@ class GupyCollector(BaseCollector):
                     data = parsed.get("data", {})
                     if not isinstance(data, dict):
                         return {}
-                    self._last_detail_success = True
-                    self.record_attempt('gupy', 'detail', started, query={'job_id': job_id},
-                                        http_status=response.status_code, result_count=1 if data else 0,
-                                        native_ids=[job_id] if data else [])
                     detail = data.get('job') or data.get('data')
                     if isinstance(detail, dict):
-                        return detail
-                    return data if data.get('id') else {}
+                        usable_detail = bool(detail)
+                    else:
+                        detail = data if data.get('id') else {}
+                        usable_detail = bool(detail)
+                    self._last_detail_success = usable_detail
+                    self.record_attempt('gupy', 'detail', started, query={'job_id': job_id},
+                                        http_status=response.status_code,
+                                        result_count=1 if usable_detail else 0,
+                                        native_ids=[job_id] if usable_detail else [],
+                                        reason=(
+                                            ('publication_date_found' if any(detail.get(field) for field in
+                                             ('publishedAt', 'publishedDate', 'createdAt'))
+                                             else 'publication_date_missing')
+                                            if usable_detail else 'MCP response contained no usable job detail'
+                                        ))
+                    return detail if usable_detail else {}
         except (requests.RequestException, ValueError, TypeError, KeyError):
             self.record_attempt('gupy', 'detail', started, query={'job_id': job_id},
                                 error_type='ERROR', reason='detail request or parsing failed')
@@ -178,6 +188,14 @@ class GupyCollector(BaseCollector):
                 "parameters": dict(q_args),
                 "results": len(raw_jobs),
                 "status": self._last_query_status,
+                "detail_candidates": 0,
+                "detail_attempts": 0,
+                "detail_successes": 0,
+                "detail_dates_found": 0,
+                "detail_dates_missing": 0,
+                "unknown_date_rejections": 0,
+                "detail_cache_hits": 0,
+                "detail_limit_skips": 0,
             })
             for raw in raw_jobs:
                 job_id = str(raw.get("id"))
@@ -185,16 +203,23 @@ class GupyCollector(BaseCollector):
                     'publishedAt', 'publishedDate', 'createdAt'
                 ))
                 if not raw.get("description") or not has_publication_date:
+                    stats = self.query_stats[-1]
+                    stats["detail_candidates"] += 1
                     cached_detail = self._cached_detail(job_id)
                     if cached_detail is not None:
+                        stats["detail_cache_hits"] += 1
                         raw = {**raw, **cached_detail}
                     elif self.detail_attempts < self.detail_limit:
                         attempts_before = self.detail_attempts
                         detail = self._get_detail(job_id)
                         if self.detail_attempts > attempts_before:
+                            stats["detail_attempts"] += 1
                             raw = {**raw, **detail}
                             if self._last_detail_success:
+                                stats["detail_successes"] += 1
                                 self._remember_detail(job_id, detail)
+                    else:
+                        stats["detail_limit_skips"] += 1
                 title = normalize_title(raw.get("name", ""))
                 company = raw.get("careerPageName", "").strip() or "Empresa Gupy"
                 city = raw.get("city", "")
@@ -209,8 +234,12 @@ class GupyCollector(BaseCollector):
 
                 published_at = (raw.get("publishedAt") or raw.get("publishedDate")
                                 or raw.get("createdAt") or "")
+                if published_at and not has_publication_date:
+                    self.query_stats[-1]["detail_dates_found"] += 1
                 if self.max_age_hours and self.require_publication_date and not published_at:
                     self.query_stats[-1].setdefault("warnings", []).append("MISSING_PUBLICATION_DATE")
+                    self.query_stats[-1]["detail_dates_missing"] += 1
+                    self.query_stats[-1]["unknown_date_rejections"] += 1
                     self.record_candidate_rejection(
                         'gupy', job_id, title, 'freshness_filter',
                         'A API não forneceu data de publicação e a política exige uma data verificável',
