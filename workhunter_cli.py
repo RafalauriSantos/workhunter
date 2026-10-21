@@ -3,7 +3,13 @@ import argparse
 import json
 import os
 import sqlite3
+import math
+import statistics
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+from zoneinfo import ZoneInfo
 
 from storage.sqlite_store import SQLiteStore
 from core.source_identity import extract_source_identity
@@ -19,9 +25,13 @@ def audit_job(store, source, native_id):
             'SELECT payload FROM jobs WHERE source=? AND external_id=?',
             (source, native_id),
         ).fetchone()
+        # Collectors use provider-specific operation names for discovery
+        # (e.g. GitHub `issues`, RSS `feed`, GeekHunter `listing`). Only
+        # `detail` calls enrich a vacancy already found and must not count as
+        # evidence that a search returned it.
         attempt_rows = db.execute('''SELECT cycle_id,operation,query,started,finished,
             result_count,native_ids,http_status,error_type,timed_out,reason
-            FROM collection_attempts WHERE source=? AND operation='search' ORDER BY id''', (source,)).fetchall()
+            FROM collection_attempts WHERE source=? AND operation!='detail' ORDER BY id''', (source,)).fetchall()
         rejection_rows = db.execute('''SELECT cycle_id,title,query,url,published_at,
             stage,reason,created_at FROM candidate_rejections
             WHERE source=? AND source_job_id=? ORDER BY id''', (source, native_id)).fetchall()
@@ -53,6 +63,28 @@ def audit_job(store, source, native_id):
             'error_type': row['error_type'], 'timed_out': bool(row['timed_out']),
             'reason': row['reason'],
         })
+
+    query_summary = {}
+    for attempt in search_attempts:
+        query = attempt.get('query')
+        try:
+            query_key = json.dumps(query, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            query_key = str(query)
+        summary = query_summary.setdefault(query_key, {
+            'query': query, 'observations': 0, 'first_observed_at': None,
+            'last_observed_at': None, 'cycles': [],
+        })
+        summary['observations'] += 1
+        observed_at = attempt.get('finished') or attempt.get('started')
+        if observed_at and (summary['first_observed_at'] is None
+                            or observed_at < summary['first_observed_at']):
+            summary['first_observed_at'] = observed_at
+        if observed_at and (summary['last_observed_at'] is None
+                            or observed_at > summary['last_observed_at']):
+            summary['last_observed_at'] = observed_at
+        if attempt.get('cycle_id') and attempt['cycle_id'] not in summary['cycles']:
+            summary['cycles'].append(attempt['cycle_id'])
 
     rejections = []
     for row in rejection_rows:
@@ -129,6 +161,8 @@ def audit_job(store, source, native_id):
         decision_summary = {
             'decision': decision_name, 'reason': latest.get('decision_reason'),
             'score': latest.get('final_score'), 'timestamp': latest.get('timestamp'),
+            'score_breakdown': latest.get('score_breakdown') or {},
+            'match_reasons': latest.get('match_reasons') or [],
         }
     else:
         decision_summary = None
@@ -141,24 +175,404 @@ def audit_job(store, source, native_id):
                           'found_in_search_not_persisted' if search_attempts else
                           'no_collection_evidence_in_retained_audit')
 
+    evidence_gap = None
+    if classification == 'seen_without_decision_evidence':
+        evidence_gap = (
+            'A vaga consta no estado legado de "já vista", mas não há tentativa de busca, '
+            'rejeição ou decisão retida para reconstruir por que não foi enviada.'
+        )
+    elif classification == 'found_in_search_not_persisted':
+        evidence_gap = (
+            'O ID apareceu em uma resposta de busca, mas não há registro persistido da vaga; '
+            'a evidência disponível não identifica em qual etapa ela se perdeu.'
+        )
+
     source_info = (payload or {}).get('sources', {}).get(source, {})
+    persisted_first_seen = source_info.get('first_seen') or (payload or {}).get('first_seen')
+    capture_times = [item['finished'] for item in search_attempts if item.get('finished')]
+    first_seen = min(capture_times) if capture_times else persisted_first_seen
+    # Busy feeds can return the same vacancy on every scheduled poll. Keep
+    # every observation in SQLite while bounding CLI output to the first hit
+    # and the four latest observations.
+    attempt_count = len(search_attempts)
+    if attempt_count > 5:
+        search_attempts = [search_attempts[0], *search_attempts[-4:]]
+    compact_queries = []
+    for summary in query_summary.values():
+        cycles = summary.pop('cycles')
+        summary['distinct_cycles'] = len(cycles)
+        summary['first_cycle_id'] = cycles[0] if cycles else None
+        summary['last_cycle_id'] = cycles[-1] if cycles else None
+        compact_queries.append(summary)
+
     return {
         'source': source, 'native_id': native_id, 'classification': classification,
+        'evidence_gap': evidence_gap,
         'title': (payload or {}).get('title') or (rejections[-1]['title'] if rejections else None),
         'published_at': (payload or {}).get('published_at') or (rejections[-1]['published_at'] if rejections else None),
-        'first_seen': source_info.get('first_seen') or (payload or {}).get('first_seen'),
+        'first_seen': first_seen,
+        'persisted_first_seen': persisted_first_seen,
         'search_attempts': search_attempts, 'source_rejections': rejections,
+        'search_attempt_count': attempt_count,
+        'search_attempts_truncated': attempt_count > len(search_attempts),
+        'queries': compact_queries,
         'pipeline_skips': pipeline_skips,
         'legacy_seen_state': legacy_seen_state,
         'stored_job': payload,
         'decision': decision_summary,
+        'candidate_score': (decision_summary.get('score') if decision_summary else
+                            (payload or {}).get('match_score')),
+        'score_breakdown': ((decision_summary or {}).get('score_breakdown')
+                            or (payload or {}).get('score_breakdown') or {}),
+        'match_reasons': ((decision_summary or {}).get('match_reasons')
+                          or (payload or {}).get('match_reasons') or []),
         'outbox': matched_outbox, 'channel_attempts': channels,
         'delivery_history': delivery_history,
         'deduplication': {
             'source_count': len((payload or {}).get('sources') or {}),
             'duplicate_listings': ((payload or {}).get('analysis') or {}).get('duplicate_listings', []),
+            'capture_observations': attempt_count,
+            'repeat_observations': max(0, attempt_count - 1),
+            'distinct_queries': len(query_summary),
         },
     }
+
+
+def _parse_utc(value, naive_timezone=timezone.utc):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=naive_timezone)
+    return parsed.astimezone(timezone.utc)
+
+
+def _query_descriptor(source, raw_query):
+    try:
+        query = json.loads(raw_query) if isinstance(raw_query, str) else raw_query
+    except (TypeError, ValueError):
+        query = raw_query
+    if isinstance(query, dict):
+        if query.get('repo'):
+            return 'direct', f"GitHub repository: {query['repo']}"
+        url = query.get('url')
+        if url:
+            parsed = urlparse(str(url))
+            host = parsed.netloc.lower()
+            if host == 'news.google.com' or host.endswith('.google.com'):
+                phrase = parse_qs(parsed.query).get('q', [''])[0]
+                return 'aggregator', f"Google News: {unquote(phrase)[:140]}"
+            label = f"{host}{parsed.path[:70]}"
+            query_text = parse_qs(parsed.query).get('keywords', [''])[0]
+            if query_text:
+                label += f" · {unquote(query_text)[:100]}"
+            return 'direct', label
+        for key in ('keywords', 'term', 'query', 'companyId'):
+            if query.get(key):
+                return ('direct' if source != 'rss' else 'aggregator'), f"{key}: {str(query[key])[:140]}"
+        return 'unknown', json.dumps(query, ensure_ascii=False, sort_keys=True)[:140]
+    return 'unknown', str(query or 'query not recorded')[:140]
+
+
+def audit_sources(store, since_days=7, now=None):
+    """Summarize source attempts, captured IDs, pipeline outcomes, and latency."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(1, int(since_days)))
+    with store.connect() as db:
+        attempts = db.execute('''SELECT source,operation,query,started,finished,http_status,result_count,
+            native_ids,timed_out,error_type,reason FROM collection_attempts ORDER BY id''').fetchall()
+        jobs = db.execute('SELECT source,external_id,payload FROM jobs').fetchall()
+        decisions = db.execute("SELECT payload FROM events WHERE kind='decision'").fetchall()
+        state_row = db.execute("SELECT value FROM metadata WHERE key='state'").fetchone()
+        rejections = db.execute('''SELECT source,source_job_id,stage,reason,created_at,query
+            FROM candidate_rejections WHERE created_at >= ?''', (cutoff.isoformat(),)).fetchall()
+    try:
+        persisted_state = json.loads(state_row[0]) if state_row else {}
+    except (TypeError, ValueError):
+        persisted_state = {}
+
+    stats = defaultdict(lambda: {
+        'calls': 0, 'http_success': 0, 'http_429': 0, 'timeouts': 0,
+        'items_returned': 0, 'unique_ids_returned': set(), 'first_captures': set(),
+        'decisions': Counter(), 'rejections': Counter(), 'latency_minutes': [],
+        'unique_rejected_ids': set(), 'unique_rejections_by_reason': defaultdict(set),
+        'delivery_attempts': Counter(), 'delivery_statuses': Counter(),
+        'delivery_by_channel': defaultdict(lambda: {
+            'attempts': 0, 'statuses': Counter(), 'delivered_fingerprints': set(),
+        }),
+        'unknown_publication_time': 0, 'queries': defaultdict(lambda: {
+            'type': 'unknown', 'calls': 0, 'http_success': 0, 'http_429': 0,
+            'timeouts': 0, 'items_returned': 0, 'unique_ids_returned': set(),
+            'first_captures': set(), 'latency_minutes': [], 'unknown_publication_time': 0,
+            'decisions': Counter(), 'delivery_attempts': Counter(),
+            'delivery_statuses': Counter(), 'delivered_fingerprints': set(),
+            'rejections': Counter(), 'unique_rejected_ids': set(),
+            'unique_rejections_by_reason': defaultdict(set),
+        }),
+    })
+    first_capture = {}
+    detail_metrics = defaultdict(lambda: {
+        'attempts': 0, 'successes': 0, 'empty_results': 0, 'http_429': 0,
+        'timeouts': 0, 'other_failures': 0,
+        'publication_dates_found': 0, 'publication_dates_missing': 0,
+    })
+    rss_host_attempts = defaultdict(list)
+    for (source, operation, raw_query, started, finished, http_status, result_count,
+         raw_ids, timed_out, error_type, reason) in attempts:
+        source = str(source)
+        if operation == 'detail':
+            detail_finished = _parse_utc(finished)
+            if detail_finished and detail_finished >= cutoff:
+                stats[source]
+                detail = detail_metrics[source]
+                detail['attempts'] += 1
+                detail['successes'] += int(isinstance(http_status, int) and 200 <= http_status < 300 and int(result_count or 0) > 0)
+                detail['empty_results'] += int(isinstance(http_status, int) and 200 <= http_status < 300 and int(result_count or 0) == 0)
+                detail['http_429'] += int(http_status == 429)
+                detail['timeouts'] += int(bool(timed_out))
+                detail['other_failures'] += int(bool(error_type) and http_status != 429 and not timed_out)
+                detail['publication_dates_found'] += int(reason == 'publication_date_found')
+                detail['publication_dates_missing'] += int(reason == 'publication_date_missing')
+        if source == 'rss' and operation == 'feed':
+            try:
+                query = json.loads(raw_query) if raw_query else {}
+            except (TypeError, ValueError):
+                query = {}
+            feed_url = query.get('url', '') if isinstance(query, dict) else ''
+            host = (urlparse(str(feed_url)).hostname or 'host-desconhecido').lower()
+            rss_host_attempts[host].append({
+                'started': started, 'finished': finished, 'http_status': http_status,
+                'timed_out': bool(timed_out), 'error_type': error_type,
+            })
+        captured_at = _parse_utc(finished)
+        if operation == 'detail' or not captured_at:
+            continue
+        query_type, query_label = _query_descriptor(str(source), raw_query)
+        try:
+            ids = {str(item) for item in json.loads(raw_ids or '[]') if item}
+        except (TypeError, ValueError):
+            ids = set()
+        for native_id in ids:
+            key = (str(source), native_id)
+            if key not in first_capture or captured_at < first_capture[key]['at']:
+                first_capture[key] = {'at': captured_at, 'query': query_label}
+        if captured_at < cutoff:
+            continue
+        item = stats[str(source)]
+        query_item = item['queries'][query_label]
+        query_item['type'] = query_type
+        item['calls'] += 1
+        item['http_success'] += isinstance(http_status, int) and 200 <= http_status < 300
+        item['http_429'] += http_status == 429
+        item['timeouts'] += bool(timed_out)
+        item['items_returned'] += int(result_count or 0)
+        item['unique_ids_returned'].update(ids)
+        query_item['calls'] += 1
+        query_item['http_success'] += isinstance(http_status, int) and 200 <= http_status < 300
+        query_item['http_429'] += http_status == 429
+        query_item['timeouts'] += bool(timed_out)
+        query_item['items_returned'] += int(result_count or 0)
+        query_item['unique_ids_returned'].update(ids)
+
+    job_publication = {}
+    for source, native_id, raw_payload in jobs:
+        try:
+            payload = json.loads(raw_payload or '{}')
+        except (TypeError, ValueError):
+            continue
+        job_publication[(str(source), str(native_id))] = payload.get('published_at')
+
+    for key, capture in first_capture.items():
+        captured_at = capture['at']
+        if captured_at < cutoff:
+            continue
+        source, native_id = key
+        item = stats[source]
+        item['first_captures'].add(native_id)
+        query_item = item['queries'][capture['query']]
+        query_item['first_captures'].add(native_id)
+        published_at = _parse_utc(job_publication.get(key))
+        if not published_at:
+            item['unknown_publication_time'] += 1
+            query_item['unknown_publication_time'] += 1
+            continue
+        delay = (captured_at - published_at).total_seconds() / 60
+        if delay < 0:
+            item['unknown_publication_time'] += 1
+            query_item['unknown_publication_time'] += 1
+            continue
+        item['latency_minutes'].append(delay)
+        query_item['latency_minutes'].append(delay)
+
+    for (raw,) in decisions:
+        try:
+            decision = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        # StateStore.record_decision historically writes datetime.now() with
+        # no timezone, so those values are local wall time (America/Sao_Paulo).
+        # Collection-attempt and job timestamps are UTC-aware; only decisions
+        # need this legacy compatibility rule.
+        timestamp = _parse_utc(decision.get('timestamp'), ZoneInfo('America/Sao_Paulo'))
+        source = str(decision.get('source') or '')
+        if timestamp and timestamp >= cutoff and source:
+            decision_name = str(decision.get('decision') or 'UNKNOWN')
+            stats[source]['decisions'][decision_name] += 1
+            raw_job_id = str(decision.get('job_id') or '')
+            prefix = f'{source}:'
+            native_id = raw_job_id[len(prefix):] if raw_job_id.startswith(prefix) else raw_job_id
+            capture = first_capture.get((source, native_id))
+            query_label = capture.get('query') if capture else None
+            if query_label in stats[source]['queries']:
+                stats[source]['queries'][query_label]['decisions'][decision_name] += 1
+    for delivery in persisted_state.get('delivery_audit', []):
+        timestamp = _parse_utc(delivery.get('finished_at') or delivery.get('timestamp'))
+        if not timestamp or timestamp < cutoff:
+            continue
+        status = str(delivery.get('status') or 'UNKNOWN').upper()
+        channel = str(delivery.get('channel') or 'unknown')
+        fingerprint = str(delivery.get('fingerprint') or delivery.get('attempt_id') or '')
+        for raw_source_id in delivery.get('source_ids') or []:
+            source = str(raw_source_id).split(':', 1)[0]
+            if not source:
+                continue
+            item = stats[source]
+            item['delivery_attempts'][channel] += 1
+            item['delivery_statuses'][status] += 1
+            channel_stats = item['delivery_by_channel'][channel]
+            channel_stats['attempts'] += 1
+            channel_stats['statuses'][status] += 1
+            if status == 'DELIVERED' and fingerprint:
+                channel_stats['delivered_fingerprints'].add(fingerprint)
+            raw_source_id = str(raw_source_id)
+            native_id = raw_source_id.split(':', 1)[1] if ':' in raw_source_id else raw_source_id
+            capture = first_capture.get((source, native_id))
+            query_label = capture.get('query') if capture else None
+            if query_label in item['queries']:
+                query_stats = item['queries'][query_label]
+                query_stats['delivery_attempts'][channel] += 1
+                query_stats['delivery_statuses'][status] += 1
+                if status == 'DELIVERED' and fingerprint:
+                    query_stats['delivered_fingerprints'].add((channel, fingerprint))
+    for source, source_job_id, stage, reason, created_at, raw_query in rejections:
+        if _parse_utc(created_at):
+            source = str(source)
+            rejection = f'{stage}: {reason}'
+            item = stats[source]
+            item['rejections'][rejection] += 1
+            query_type, query_label = _query_descriptor(source, raw_query)
+            query_item = item['queries'][query_label]
+            query_item['type'] = query_type
+            query_item['rejections'][rejection] += 1
+            native_id = str(source_job_id or '')
+            if native_id:
+                item['unique_rejected_ids'].add(native_id)
+                item['unique_rejections_by_reason'][rejection].add(native_id)
+                query_item['unique_rejected_ids'].add(native_id)
+                query_item['unique_rejections_by_reason'][rejection].add(native_id)
+
+    rss_hosts = {}
+    for host, host_attempts in sorted(rss_host_attempts.items()):
+        in_window = [a for a in host_attempts if (parsed := _parse_utc(a['finished'])) and parsed >= cutoff]
+        if not in_window:
+            continue
+        in_window.sort(key=lambda a: (_parse_utc(a['finished']) or datetime.min.replace(tzinfo=timezone.utc)))
+        streak = 0
+        for attempt in reversed(in_window):
+            success = (isinstance(attempt['http_status'], int)
+                       and 200 <= attempt['http_status'] < 400 and not attempt['timed_out'])
+            if success:
+                break
+            streak += 1
+        rss_hosts[host] = {
+            'attempts': len(in_window),
+            'successes': sum(isinstance(a['http_status'], int) and 200 <= a['http_status'] < 400 and not a['timed_out'] for a in in_window),
+            'timeouts': sum(a['timed_out'] for a in in_window),
+            'http_429': sum(a['http_status'] == 429 for a in in_window),
+            'failures': sum(not (isinstance(a['http_status'], int) and 200 <= a['http_status'] < 400 and not a['timed_out']) for a in in_window),
+            'consecutive_failures': streak,
+            'last_status': in_window[-1]['http_status'],
+            'last_error': in_window[-1]['error_type'],
+        }
+
+    output = {}
+    for source, item in sorted(stats.items()):
+        latencies = sorted(item['latency_minutes'])
+        p90 = latencies[max(0, math.ceil(0.9 * len(latencies)) - 1)] if latencies else None
+        query_output = {}
+        for label, query_item in sorted(item['queries'].items()):
+            query_latencies = sorted(query_item['latency_minutes'])
+            query_p90 = (query_latencies[max(0, math.ceil(0.9 * len(query_latencies)) - 1)]
+                         if query_latencies else None)
+            query_output[label] = {
+                'type': query_item['type'], 'calls': query_item['calls'],
+                'http_success': query_item['http_success'], 'http_429': query_item['http_429'],
+                'timeouts': query_item['timeouts'], 'items_returned': query_item['items_returned'],
+                'unique_ids_returned': len(query_item['unique_ids_returned']),
+                'first_captures': len(query_item['first_captures']),
+                'decisions': dict(query_item['decisions']),
+                'rejections': dict(query_item['rejections'].most_common(10)),
+                'rejection_records': sum(query_item['rejections'].values()),
+                'unique_rejected_candidates': len(query_item['unique_rejected_ids']),
+                'unique_rejections_by_reason': {
+                    key: len(ids) for key, ids in sorted(query_item['unique_rejections_by_reason'].items())
+                },
+                'delivery': {
+                    'attempts': sum(query_item['delivery_attempts'].values()),
+                    'statuses': dict(query_item['delivery_statuses']),
+                    'delivered_alerts': len(query_item['delivered_fingerprints']),
+                    'attempts_by_channel': dict(query_item['delivery_attempts']),
+                },
+                'publication_to_capture_minutes': {
+                    'samples': len(query_latencies),
+                    'median': round(statistics.median(query_latencies), 1) if query_latencies else None,
+                    'p90': round(query_p90, 1) if query_p90 is not None else None,
+                    'unknown_publication_time': query_item['unknown_publication_time'],
+                },
+            }
+        delivery_by_channel = {
+            channel: {
+                'attempts': value['attempts'],
+                'statuses': dict(value['statuses']),
+                'delivered_alerts': len(value['delivered_fingerprints']),
+            }
+            for channel, value in sorted(item['delivery_by_channel'].items())
+        }
+        output[source] = {
+            'calls': item['calls'], 'http_success': item['http_success'],
+            'http_429': item['http_429'], 'timeouts': item['timeouts'],
+            'items_returned': item['items_returned'],
+            'unique_ids_returned': len(item['unique_ids_returned']),
+            'first_captures_in_window': len(item['first_captures']),
+            'publication_to_capture_minutes': {
+                'samples': len(latencies),
+                'median': round(statistics.median(latencies), 1) if latencies else None,
+                'p90': round(p90, 1) if p90 is not None else None,
+                'unknown_publication_time': item['unknown_publication_time'],
+            },
+            'decisions': dict(item['decisions']),
+            'rejections': dict(item['rejections'].most_common(10)),
+            'rejection_records': sum(item['rejections'].values()),
+            'unique_rejected_candidates': len(item['unique_rejected_ids']),
+            'unique_rejections_by_reason': {
+                key: len(ids) for key, ids in sorted(item['unique_rejections_by_reason'].items())
+            },
+            'delivery': {
+                'attempts': sum(item['delivery_attempts'].values()),
+                'statuses': dict(item['delivery_statuses']),
+                'delivered_alerts': sum(
+                    channel['delivered_alerts'] for channel in delivery_by_channel.values()
+                ),
+                'by_channel': delivery_by_channel,
+            },
+            'detail_enrichment': detail_metrics[source],
+            'queries': query_output,
+        }
+    return {'since': cutoff.isoformat(), 'until': now.isoformat(), 'sources': output,
+            'rss_hosts': rss_hosts}
 
 
 def diagnose(store):
@@ -348,6 +762,9 @@ def main(argv=None):
     audit_cmd.add_argument('--json', action='store_true', help='print the full vacancy evidence trace as JSON')
     diagnose_cmd = sub.add_parser('diagnose', help='classify manually found URLs against collection evidence')
     diagnose_cmd.add_argument('--json', action='store_true', help='print the full vacancy evidence trace as JSON')
+    source_audit_cmd = sub.add_parser('audit-sources', help='summarize collection performance by source')
+    source_audit_cmd.add_argument('--days', type=int, default=7, help='lookback window in days (default: 7)')
+    source_audit_cmd.add_argument('--json', action='store_true', help='print machine-readable source metrics')
     sub.add_parser('worker-once', help='run one isolated manual analysis cycle')
     sub.add_parser('health', help='show operational health checks')
     args = parser.parse_args(argv)
@@ -397,9 +814,92 @@ def main(argv=None):
             print(f"{result['classification']}: {result['source']}:{result['native_id']} — {result.get('title') or 'sem registro local'}")
             print(f"Publicação: {result.get('published_at') or 'desconhecida'} | Primeira captura: {result.get('first_seen') or 'sem captura persistida'}")
             print(f"Consultas relacionadas: {len(result['search_attempts'])} | Rejeições: {len(result['source_rejections'])}")
+            if result.get('evidence_gap'):
+                print(f"Limite da auditoria: {result['evidence_gap']}")
+            for query_info in result['queries']:
+                query = query_info.get('query') or {}
+                if isinstance(query, dict):
+                    label = next((query.get(key) for key in ('keywords', 'term', 'query', 'url', 'repo')
+                                  if query.get(key)), query)
+                else:
+                    label = query
+                print(f"Consulta observada {query_info['observations']}x em "
+                      f"{query_info['distinct_cycles']} ciclo(s): {label}")
+            for attempt in result['search_attempts']:
+                query = attempt.get('query') or {}
+                if isinstance(query, dict):
+                    label = next((query.get(key) for key in ('keywords', 'term', 'query', 'url', 'repo')
+                                  if query.get(key)), query)
+                else:
+                    label = query
+                label = str(label)
+                if len(label) > 160:
+                    label = label[:157] + '...'
+                print(f"Busca: {attempt.get('finished') or attempt.get('started') or '?'} — {label} "
+                      f"(HTTP {attempt.get('http_status') or 'N/D'}, {attempt.get('result_count', 0)} resultados)")
+            for rejection in result['source_rejections']:
+                print(f"Filtro: {rejection['stage']} — {rejection['reason']}")
+            for skip in result['pipeline_skips']:
+                print(f"Pipeline: {skip.get('stage') or 'skip'} — {skip.get('reason') or 'sem motivo'}")
             if result.get('decision'):
-                print(f"Decisão: {result['decision']['decision']} — {result['decision']['reason'] or 'sem motivo'}")
+                decision = result['decision']
+                score = f" | score {decision['score']}/100" if decision.get('score') is not None else ''
+                print(f"Decisão: {decision['decision']}{score} — {decision['reason'] or 'sem motivo'}")
+                if decision.get('score_breakdown'):
+                    print(f"Componentes do score: {decision['score_breakdown']}")
+                for reason in decision.get('match_reasons', []):
+                    print(f"  • {reason}")
             print(f"Outbox: {len(result['outbox'])} | Tentativas por canal: {len(result['channel_attempts'])}")
+            for delivery in result['delivery_history']:
+                print(f"Entrega: {delivery.get('channel')} — {delivery.get('status')} em "
+                      f"{delivery.get('timestamp') or delivery.get('finished_at') or 'horário indisponível'}")
+        return 0
+    if args.command == 'audit-sources':
+        data_dir = Path(os.getenv('JOB_FINDER_DATA_DIR', Path.home() / '.job-finder'))
+        result = audit_sources(SQLiteStore(data_dir / 'state.db'), args.days)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return 0
+        print(f"Métricas por fonte desde {result['since']}")
+        for source, item in result['sources'].items():
+            timing = item['publication_to_capture_minutes']
+            median = timing['median']
+            median_text = f"{median} min" if median is not None else 'N/D'
+            print(
+                f"{source}: {item['first_captures_in_window']} novas capturas; "
+                f"{item['unique_ids_returned']} IDs únicos vistos; "
+                f"{item['delivery']['delivered_alerts']} alertas entregues; "
+                f"{item['http_429']} HTTP 429; {item['timeouts']} timeouts; "
+                f"latência mediana {median_text} ({timing['samples']} com data verificável)"
+            )
+            detail = item.get('detail_enrichment', {})
+            if detail.get('attempts'):
+                print(f"  enriquecimento: {detail['successes']}/{detail['attempts']} úteis; "
+                      f"{detail['empty_results']} sem dados, {detail['http_429']} HTTP 429, "
+                      f"{detail['timeouts']} timeouts; datas Gupy recuperadas/ausentes: "
+                      f"{detail['publication_dates_found']}/{detail['publication_dates_missing']}")
+            if item['decisions']:
+                print(f"  decisões: {item['decisions']}")
+            if item['rejections']:
+                print(
+                    f"  descartes: {item['unique_rejected_candidates']} IDs únicos / "
+                    f"{item['rejection_records']} registros; motivos: {item['unique_rejections_by_reason']}"
+                )
+            if source == 'rss' and item.get('queries'):
+                modes = defaultdict(lambda: {'queries': 0, 'query_first_captures': 0, 'delivered_alerts': 0})
+                for query_stats in item['queries'].values():
+                    mode = query_stats.get('type', 'unclassified')
+                    modes[mode]['queries'] += 1
+                    modes[mode]['query_first_captures'] += query_stats.get('first_captures', 0)
+                    modes[mode]['delivered_alerts'] += query_stats.get('delivery', {}).get('delivered_alerts', 0)
+                for mode, stats in sorted(modes.items()):
+                    print(f"  RSS {mode}: {stats['queries']} consultas; "
+                          f"{stats['query_first_captures']} primeiras capturas por consulta; "
+                          f"{stats['delivered_alerts']} alertas entregues")
+        for host, item in result.get('rss_hosts', {}).items():
+            print(f"RSS host {host}: {item['successes']}/{item['attempts']} respostas úteis; "
+                  f"{item['timeouts']} timeouts, {item['http_429']} HTTP 429, "
+                  f"{item['consecutive_failures']} falhas consecutivas")
         return 0
     if args.command == 'worker-once':
         from workhunter_worker import run as run_worker

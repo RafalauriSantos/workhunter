@@ -28,6 +28,7 @@ _PROVIDER_UNAVAILABLE = set()
 _PROVIDER_UNAVAILABLE_UNTIL = {}
 _PROVIDER_COOLDOWN_SECONDS = 300
 _CYCLE_CALLS = 0
+_HEALTH_OBSERVER = None
 _REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "12"))
 _MAX_RATE_LIMIT_RETRIES = 1
 
@@ -235,6 +236,21 @@ def usage_stats():
     return {"calls": _CYCLE_CALLS}
 
 
+def set_health_observer(observer):
+    """Install a callback for sanitized provider outcomes, if durable storage exists."""
+    global _HEALTH_OBSERVER
+    _HEALTH_OBSERVER = observer
+
+
+def _record_provider_outcome(provider, model, status):
+    if _HEALTH_OBSERVER is None:
+        return
+    try:
+        _HEALTH_OBSERVER(provider, model, status)
+    except Exception as exc:
+        logger.warning("Não foi possível persistir a saúde do provedor LLM (%s)", type(exc).__name__)
+
+
 def judge(title: str, company: str, description: str) -> Optional[Dict[str, Any]]:
     """
     Avalia a vaga usando o provider configurado.
@@ -267,9 +283,11 @@ def judge(title: str, company: str, description: str) -> Optional[Dict[str, Any]
                 normalized = normalize_result(result)
                 normalized["llm_provider"] = provider
                 normalized["llm_model"] = model
+                _record_provider_outcome(provider, model, "OK")
                 return normalized
         except Exception as e:
             logger.warning("LLM judge falhou no provider %s (%s: %s)", provider, type(e).__name__, e)
+        _record_provider_outcome(provider, model, "FAILED")
         logger.warning("Tentando próximo provider LLM após falha em %s", provider)
 
     return None

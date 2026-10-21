@@ -178,6 +178,29 @@ class SQLiteStore(StateStore):
                 attempt.get('error_type'), int(bool(attempt.get('timed_out'))), int(attempt.get('retry_count', 0)),
                 attempt.get('reason')))
 
+    def get_last_collection_attempt(self, source, operation=None):
+        """Return the latest persisted attempt for a source, decoded for planning."""
+        sql = '''SELECT cycle_id,operation,query,started,finished,http_status,result_count
+                 FROM collection_attempts WHERE source=?'''
+        params = [str(source)]
+        if operation:
+            sql += ' AND operation=?'
+            params.append(str(operation))
+        sql += ' ORDER BY id DESC LIMIT 1'
+        with self.connect() as db:
+            row = db.execute(sql, params).fetchone()
+        if not row:
+            return None
+        try:
+            query = json.loads(row[2]) if row[2] else None
+        except (TypeError, ValueError):
+            query = row[2]
+        return {
+            'cycle_id': row[0], 'operation': row[1], 'query': query,
+            'started': row[3], 'finished': row[4], 'http_status': row[5],
+            'result_count': row[6],
+        }
+
     def record_candidate_rejection(self, rejection):
         self.record_candidate_rejections([rejection])
 

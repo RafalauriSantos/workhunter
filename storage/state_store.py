@@ -308,6 +308,8 @@ class StateStore:
         category: str = "",
         potential_score: int = 0,
         operational_seniority: str = "",
+        score_breakdown: Dict[str, Any] = None,
+        match_reasons: List[str] = None,
         max_history: int = 150,
     ):
         """Registra a trilha de auditoria para responder por que cada vaga foi aceita ou rejeitada (SPEC-008)."""
@@ -329,6 +331,8 @@ class StateStore:
             "category": category,
             "potential_score": potential_score,
             "operational_seniority": operational_seniority,
+            "score_breakdown": dict(score_breakdown or {}),
+            "match_reasons": list(match_reasons or []),
         }
         if "recent_decisions" not in self.state:
             self.state["recent_decisions"] = []

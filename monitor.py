@@ -24,7 +24,8 @@ from notify.telegram_notifier import TelegramNotifier
 from notify.email_notifier import ResendEmailNotifier
 from notify.adapters import LegacyNotifierAdapter, WPPConnectAdapter, WhatsAppCloudAdapter
 from storage.state_store import StateStore
-from core.query_planner import plan_searches, unique_searches, rotate_searches
+from core.query_planner import plan_searches, unique_searches, plan_linkedin_batch
+from core.local_schedule import next_fixed_slot_poll
 from core.delivery_workflow import finalize_delivery
 from core.eligibility import classify_score, classify_evidence, classify_location
 from core.scope_analyzer import analyze_scope
@@ -92,12 +93,19 @@ HTTP = get_http_session()
 
 def format_linkedin_query_stats(query):
     """Format a LinkedIn query record without assuming a live search ran."""
+    skipped = query.get("enrichment_skipped_reason")
     return (
         f"│  └─ busca='{query.get('keywords', '*')}' janela={query.get('time_range', 'n/a')} "
         f"páginas={query.get('pages', 0)} cartões={query.get('cards', 0)} "
         f"válidas={query.get('parsed_jobs', 0)} enriquecidas={query.get('enrichment_successes', 0)}/"
         f"{query.get('enrichment_attempts', 0)} status={query.get('status', 'UNKNOWN')}"
+        f"{f' detalhe pausado: {skipped}' if skipped else ''}"
     )
+
+
+def compose_discovered_jobs(manual, gupy, linkedin, github, trampos, rss):
+    """Prefer direct source records during deduplication; keep RSS as fallback."""
+    return manual + gupy + linkedin + github + trampos + rss
 
 
 def load_config() -> dict:
@@ -175,9 +183,10 @@ def check_heartbeat(config: dict, store: StateStore, notifier: TelegramNotifier)
             pass
 
     if now.hour >= target_hour:
+        from core.llm_health import format_health
         monitors_count = len(config.get("monitors", []))
         total_tracked = len(store.state.get("seen_fingerprints", []))
-        if notifier.send_heartbeat(monitors_count, total_tracked):
+        if notifier.send_heartbeat(monitors_count, total_tracked, format_health(store)):
             print(f"[{now.strftime('%H:%M:%S')}] Status do radar enviado ao Telegram.")
             store.set_last_heartbeat(today_str)
             store.save()
@@ -188,6 +197,19 @@ def run_check():
     llm_judge.reset_cycle_stats()
     manual_only = os.getenv('JOB_FINDER_MANUAL_ONLY') == '1'
     store = StateStore(STATE_FILE)
+    from core.llm_health import record_configuration
+    record_configuration(store)
+    if hasattr(store, 'event'):
+        llm_judge.set_health_observer(
+            lambda provider, model, status: store.event(
+                'llm_health', {
+                    'provider': provider, 'model': model, 'status': status,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        )
+    else:
+        llm_judge.set_health_observer(None)
     cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + __import__("uuid").uuid4().hex[:8]
     store.state["active_cycle_id"] = cycle_id
     notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, HTTP)
@@ -282,6 +304,7 @@ def run_check():
     gupy_status = "OK"
     linkedin_status = "OK"
     linkedin_query_stats = []
+    active_linkedin_probe = None
     gupy_query_stats = []
     rss_status = "OK"
     github_status = "OK"
@@ -366,6 +389,7 @@ def run_check():
             print(f"[LinkedInCollector] Em cooldown até {cooldown['until']}; busca suspensa após HTTP 429.")
         else:
             poll_interval = max(1, int(config.get("linkedin_poll_interval_hours", 6))) * 3600
+            poll_slots = config.get("linkedin_poll_times")
             last_poll = store.get_last_source_poll("linkedin")
             if last_poll:
                 try:
@@ -374,9 +398,15 @@ def run_check():
                         last_poll_at = last_poll_at.replace(tzinfo=timezone.utc)
                     elapsed = (datetime.now(timezone.utc) - last_poll_at).total_seconds()
                 except (TypeError, ValueError):
+                    last_poll_at = None
                     elapsed = poll_interval
-                if elapsed < poll_interval:
+                if poll_slots:
+                    next_poll = next_fixed_slot_poll(datetime.now(timezone.utc), last_poll_at, poll_slots)
+                elif elapsed < poll_interval:
                     next_poll = last_poll_at + timedelta(seconds=poll_interval)
+                else:
+                    next_poll = None
+                if next_poll:
                     linkedin_status = "THROTTLED"
                     linkedin_query_stats = [{
                         "keywords": "*", "status": "THROTTLED", "pages": 0,
@@ -387,10 +417,38 @@ def run_check():
             if linkedin_status != "THROTTLED":
                 try:
                     max_linkedin_queries = int(config.get("linkedin_max_queries", 8))
-                    linkedin_searches = rotate_searches(
-                        unique_searches(linkedin_searches), max_linkedin_queries,
-                        slot=int(time.time() // (max(1, int(config.get("check_interval_minutes", 60))) * 60)),
+                    search_plan = unique_searches(linkedin_searches)
+                    last_attempt_reader = getattr(store, "get_last_collection_attempt", None)
+                    last_attempt = (last_attempt_reader("linkedin", "search")
+                                    if callable(last_attempt_reader) else None)
+                    probe_config = config.get("linkedin_broad_query_probe")
+                    probe_id = str((probe_config or {}).get("id") or "")
+                    probe_consumed = bool(
+                        probe_id and probe_id in store.state.get("linkedin_query_probes", {})
                     )
+                    linkedin_searches, active_linkedin_probe = plan_linkedin_batch(
+                        search_plan, max_linkedin_queries,
+                        (last_attempt or {}).get("query"),
+                        probe=probe_config, probe_consumed=probe_consumed,
+                    )
+                    # This is a per-cycle budget, not a per-query multiplier.
+                    # Only the first selected query may spend it, so raising
+                    # linkedin_max_queries cannot silently multiply detail calls.
+                    detail_budget = (
+                        max(0, int(config.get("linkedin_detail_enrichment_limit", 0)))
+                        if config.get("linkedin_detail_enrichment_enabled", False) else 0
+                    )
+                    detail_cooldown = store.get_source_cooldown("linkedin_detail")
+                    if detail_cooldown:
+                        detail_budget = 0
+                        print(f"[LinkedInCollector] Enriquecimento de detalhes em cooldown até {detail_cooldown['until']}; busca segue ativa.")
+                    for search in linkedin_searches:
+                        search["detail_enrichment_limit"] = detail_budget
+                        if detail_cooldown:
+                            search["detail_enrichment_skipped_reason"] = f"HTTP_429 cooldown until {detail_cooldown['until']}"
+                        detail_budget = 0
+                    if active_linkedin_probe:
+                        print(f"[LinkedInCollector] Executando consulta ampla de validação única: {active_linkedin_probe}.")
                     li_col = LinkedInCollector(HTTP, linkedin_searches)
                     candidate_audit_collectors.append(li_col)
                     result = collect_result(li_col)
@@ -400,6 +458,30 @@ def run_check():
                         attempt['cycle_id'] = cycle_id
                         if durable:
                             store.record_collection_attempt(attempt)
+                    detail_attempts = [a for a in getattr(li_col, "collection_attempts", [])
+                                       if a.get('operation') == 'detail']
+                    if getattr(li_col, "detail_rate_limited", False):
+                        cooldown = store.register_source_rate_limit(
+                            "linkedin_detail", base_seconds=21600, max_seconds=21600
+                        )
+                        print(f"[LinkedInCollector] HTTP 429 em detalhes; somente o enriquecimento pausado por {cooldown['cooldown_seconds']}s.")
+                    elif any(isinstance(a.get('http_status'), int) and 200 <= a['http_status'] < 300
+                             for a in detail_attempts):
+                        store.clear_source_cooldown("linkedin_detail")
+                    if active_linkedin_probe and li_col.collection_attempts:
+                        probe_attempts = [a for a in li_col.collection_attempts if a.get('operation') == 'search']
+                        store.state.setdefault("linkedin_query_probes", {})[active_linkedin_probe] = {
+                            "cycle_id": cycle_id,
+                            "query_id": active_linkedin_probe,
+                            "query": (linkedin_searches[0].get("query") if linkedin_searches else ""),
+                            "status": linkedin_status,
+                            "cards": sum(int(a.get("result_count") or 0) for a in probe_attempts),
+                            "http_statuses": [a.get("http_status") for a in probe_attempts],
+                            "captured_ids": sorted({str(native_id) for attempt in probe_attempts
+                                                     for native_id in attempt.get("native_ids", [])}),
+                            "attempted_at": min((a.get("started") for a in probe_attempts if a.get("started")),
+                                                default=datetime.now(timezone.utc).isoformat()),
+                        }
                     if li_col.rate_limited:
                         cooldown = store.register_source_rate_limit("linkedin")
                         linkedin_status = "PARTIAL"
@@ -410,27 +492,6 @@ def run_check():
                     linkedin_status = f"FALHA ({e})"
         write_cycle_progress(cycle_id, 'linkedin', {'linkedin': {
             'status': linkedin_status, 'discovered': len(discovered_linkedin)
-        }} )
-
-    if rss_configs and not manual_only:
-        try:
-            rss_col = RssCollector(
-                HTTP,
-                rss_configs,
-                resolve_urls=config.get("resolve_rss_urls", False),
-                min_description_chars=config.get("rss_min_description_chars", 0),
-            )
-            candidate_audit_collectors.append(rss_col)
-            result = collect_result(rss_col)
-            discovered_rss, rss_status = result.jobs, result.status
-            for attempt in rss_col.collection_attempts:
-                attempt['cycle_id'] = cycle_id
-                if durable:
-                    store.record_collection_attempt(attempt)
-        except Exception as e:
-            rss_status = f"FALHA ({e})"
-        write_cycle_progress(cycle_id, 'rss', {'rss': {
-            'status': rss_status, 'discovered': len(discovered_rss)
         }} )
 
     if github_configs and not manual_only:
@@ -485,8 +546,34 @@ def run_check():
             'status': trampos_status, 'discovered': len(discovered_trampos)
         }} )
 
+    # Run feed searches after API-backed/direct job sources so a slow feed
+    # cannot delay them. RssCollector also orders employer-owned feeds first.
+    if rss_configs and not manual_only:
+        try:
+            rss_col = RssCollector(
+                HTTP,
+                rss_configs,
+                resolve_urls=config.get("resolve_rss_urls", False),
+                min_description_chars=config.get("rss_min_description_chars", 0),
+            )
+            candidate_audit_collectors.append(rss_col)
+            result = collect_result(rss_col)
+            discovered_rss, rss_status = result.jobs, result.status
+            for attempt in rss_col.collection_attempts:
+                attempt['cycle_id'] = cycle_id
+                if durable:
+                    store.record_collection_attempt(attempt)
+        except Exception as e:
+            rss_status = f"FALHA ({e})"
+        write_cycle_progress(cycle_id, 'rss', {'rss': {
+            'status': rss_status, 'discovered': len(discovered_rss)
+        }} )
+
     persist_rejections(candidate_audit_collectors, store, cycle_id)
-    discovered_jobs = discovered_manual + discovered_gupy + discovered_linkedin + discovered_rss + discovered_github + discovered_trampos
+    discovered_jobs = compose_discovered_jobs(
+        discovered_manual, discovered_gupy, discovered_linkedin,
+        discovered_github, discovered_trampos, discovered_rss,
+    )
 
     # 3. Deduplicação e Fusão de Múltiplas Fontes
     unique_jobs = deduplicator.process(discovered_jobs)
@@ -641,6 +728,11 @@ def run_check():
         job.match_reasons = reasons + [f"Categoria: {scope['category']}", f"Leitura do escopo: {scope['reasoning']}"]
         if gap_note:
             job.match_reasons.append(gap_note)
+        # The initial job snapshot is stored before dedupe/scoring so collection
+        # losses remain auditable. Refresh it here with the evaluated score and
+        # evidence before any downstream filter or delivery decision.
+        if durable:
+            store.remember_job(job)
 
         # A classe explicável decide elegibilidade; score apenas ordena vagas.
         # A progressão inclui pleno com sinais de escopo acessível e lacunas limitadas.
@@ -667,6 +759,7 @@ def run_check():
                 raw_url=job.raw_url, canonical_url=job.canonical_url,
                 evidence_level=job.evidence_level, category=scope["category"],
                 potential_score=scope["potential_score"], operational_seniority=scope["operational_level"],
+                score_breakdown=job.score_breakdown, match_reasons=job.match_reasons,
             )
             store.mark_seen(fp, source_ids)
             continue
@@ -681,6 +774,7 @@ def run_check():
                 raw_url=job.raw_url, canonical_url=job.canonical_url,
                 evidence_level=job.evidence_level, category=scope["category"],
                 potential_score=scope["potential_score"], operational_seniority=scope["operational_level"],
+                score_breakdown=job.score_breakdown, match_reasons=job.match_reasons,
             )
             store.mark_seen(fp, source_ids)
             continue
@@ -697,7 +791,10 @@ def run_check():
             store.record_decision(
                 job_id, primary_source, job.identity_fingerprint, job.content_hash,
                 "DISCARD_SENIOR_OR_VETO", veto_reason or label, final_score=score,
-                raw_url=job.raw_url, canonical_url=job.canonical_url, evidence_level=job.evidence_level
+                raw_url=job.raw_url, canonical_url=job.canonical_url, evidence_level=job.evidence_level,
+                category=scope["category"], potential_score=scope["potential_score"],
+                operational_seniority=scope["operational_level"],
+                score_breakdown=job.score_breakdown, match_reasons=job.match_reasons,
             )
             store.mark_seen(fp, source_ids)
             continue
@@ -711,6 +808,7 @@ def run_check():
                 raw_url=job.raw_url, canonical_url=job.canonical_url, evidence_level=job.evidence_level,
                 category=scope["category"], potential_score=scope["potential_score"],
                 operational_seniority=scope["operational_level"],
+                score_breakdown=job.score_breakdown, match_reasons=job.match_reasons,
             )
             store.mark_seen(fp, source_ids)
             continue
@@ -727,6 +825,9 @@ def run_check():
         ),
         reverse=True,
     ):
+        from core.llm_health import format_health
+        job.analysis = dict(job.analysis or {})
+        job.analysis['llm_health'] = format_health(store)
         fp = delivery_fingerprint(job)
         if durable:
             notified_count += int(deliver(
@@ -772,7 +873,13 @@ def run_check():
     for query in gupy_query_stats:
         print(
             f"│  └─ parâmetros={list(query['parameters'].keys())} "
-            f"resultados={query['results']} status={query['status']}"
+            f"resultados={query['results']} status={query['status']} "
+            f"detalhes={query.get('detail_attempts', 0)}/"
+            f"{query.get('detail_candidates', 0)} candidatos, "
+            f"datas recuperadas={query.get('detail_dates_found', 0)}, "
+            f"datas desconhecidas={query.get('detail_dates_missing', 0)}, "
+            f"rejeitadas por data desconhecida={query.get('unknown_date_rejections', 0)}, "
+            f"limite atingido={query.get('detail_limit_skips', 0)}"
         )
     print(f"├─ LinkedIn: {linkedin_status:<8} | {len(discovered_linkedin)} vaga(s)")
     for query in linkedin_query_stats:
@@ -818,6 +925,8 @@ def run_check():
         "llm_calls_today": today_llm_calls,
         "llm_fallbacks": fallback_count,
     }
+    from core.llm_health import format_health
+    health_report['llm_health'] = format_health(store)
     with open(HEALTH_REPORT_FILE, "w", encoding="utf-8") as report_file:
         json.dump(health_report, report_file, ensure_ascii=False, indent=2)
     try:
@@ -847,14 +956,20 @@ def run_check():
     store.record_source_health("github", github_status, len(discovered_github))
     store.record_source_health("trampos", trampos_status, len(discovered_trampos))
     if durable:
-        from core.operational_alerts import update_source_alerts, send_operational
+        from core.operational_alerts import (
+            send_operational, summarize_collection_attempts, update_source_alerts,
+        )
+        attempts = [attempt for collector in candidate_audit_collectors
+                    for attempt in getattr(collector, 'collection_attempts', [])]
+        source_diagnostics = summarize_collection_attempts(attempts)
+        from core.llm_health import format_health
         update_source_alerts(store, {
             'gupy': gupy_status if gupy_queries else 'NOT_CONFIGURED',
             'linkedin': linkedin_status if linkedin_searches else 'NOT_CONFIGURED',
             'rss': rss_status if rss_configs else 'NOT_CONFIGURED',
             'github': github_status if github_configs else 'NOT_CONFIGURED',
             'trampos': trampos_status if trampos_configs else 'NOT_CONFIGURED',
-        }, lambda message: send_operational(HTTP, message))
+        }, lambda message: send_operational(HTTP, f"{message}\n{format_health(store)}"), source_diagnostics)
     check_heartbeat(config, store, notifier)
     if os.getenv('JOB_FINDER_MANUAL_ONLY') == '1':
         from core.telegram_inbox import notify_finished_manual_analyses
@@ -877,9 +992,10 @@ def main():
     if "--heartbeat" in sys.argv:
         store = StateStore(STATE_FILE)
         notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, HTTP)
+        from core.llm_health import format_health
         monitors_count = len(config.get("monitors", []))
         total_tracked = len(store.state.get("seen_fingerprints", []))
-        ok = notifier.send_heartbeat(monitors_count, total_tracked)
+        ok = notifier.send_heartbeat(monitors_count, total_tracked, format_health(store))
         if ok:
             print("💚 Heartbeat de teste enviado com sucesso ao Telegram!")
         else:

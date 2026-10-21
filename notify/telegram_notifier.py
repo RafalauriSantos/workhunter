@@ -43,16 +43,16 @@ class TelegramNotifier:
             print(f"[ERRO TelegramNotifier] {type(e).__name__}")
             return False
 
-    def send_heartbeat(self, monitors_count: int, jobs_tracked: int) -> bool:
+    def send_heartbeat(self, monitors_count: int, jobs_tracked: int, llm_health: str = '') -> bool:
         if not self.token or not self.chat_id:
             return False
 
         msg = (
-            f"💚 <b>Status semanal do radar</b>\n\n"
-            f"O radar continua ativo neste computador.\n"
-            f"🏢 <b>Monitores ativos:</b> {monitors_count}\n"
-            f"💾 <b>Vagas no radar:</b> {jobs_tracked}\n"
-            f"Esta mensagem confirma o canal de envio, não a saúde de todas as fontes."
+            f"🩺 <b>WorkHunter · resumo semanal</b>\n\n"
+            f"• Operação: ativa\n"
+            f"• Fontes monitoradas: {monitors_count} · vagas acompanhadas: {jobs_tracked}\n"
+            + (f"• {llm_health}\n" if llm_health else "")
+            + "Este resumo confirma a execução do serviço; consulte /status para a saúde das fontes."
         )
 
         api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"

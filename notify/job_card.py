@@ -1,6 +1,7 @@
 """One evidence-based presentation shared by Telegram and email."""
 import html
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from core.scope_analyzer import _clean, _requirements, _hits
@@ -25,6 +26,27 @@ def application_url(job):
     return ""
 
 
+def _publication_age(value, now=None):
+    if not value:
+        return ''
+    try:
+        published = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        elapsed_seconds = ((now or datetime.now(timezone.utc)) - published).total_seconds()
+        if elapsed_seconds < 0:
+            return ''
+        minutes = int(elapsed_seconds // 60)
+    except (TypeError, ValueError):
+        return ''
+    if minutes < 60:
+        return f'há {max(1, minutes)} min'
+    hours = minutes // 60
+    if hours < 24:
+        return f'há {hours} h'
+    return f'há {hours // 24} d'
+
+
 def build_card(job):
     """Keep internal scores in storage; never present defaults as confirmed facts."""
     title = clean(job.title)
@@ -42,7 +64,8 @@ def build_card(job):
     }
     origins = list(dict.fromkeys(source_labels.get(name.lower(), clean(name, 40)) for name in job.sources))
     origin = ", ".join(origins) if origins else "Não registrada"
-    lines.append(escape(f"Fonte: {origin}"))
+    published = _publication_age(getattr(job, 'published_at', ''))
+    lines.append(escape(" · ".join(part for part in (origin, published) if part)))
     technologies = list(dict.fromkeys(clean(t, 30) for t in job.technologies if t))[:4]
     if technologies:
         lines.extend(["", escape(" · ".join(technologies))])
@@ -62,13 +85,16 @@ def build_card(job):
 
     analysis = job.analysis or {}
     matched = list(dict.fromkeys(clean(t, 30) for t in analysis.get("matched_evidence", []) if t))[:3]
-    reason = ("Tecnologias do seu perfil encontradas: " + ", ".join(matched) + ".") if matched else "Confira os requisitos antes de se candidatar."
+    reason = ("Aderência: " + ", ".join(matched)) if matched else "Aderência a conferir no anúncio"
     if job.compatibility_category in {"POTENCIALMENTE_COMPATIVEL", "DESAFIADORA_VALIDA"}:
-        reason = "Possibilidade de progressão. " + reason
+        reason = "Pode ser uma oportunidade de progressão · " + reason
     lines.extend(["", escape(reason)])
     gaps = [clean(item, 100) for item in analysis.get("trainable_gaps", []) if item]
     if gaps:
-        lines.append(escape("Requisitos sem evidência no perfil: " + "; ".join(gaps[:3])))
+        lines.append(escape("Atenção: " + "; ".join(gaps[:2]) + " sem evidência no perfil"))
+    llm_health = str(analysis.get('llm_health') or '').strip()
+    if llm_health:
+        lines.extend(['', escape(llm_health)])
 
     alternatives = analysis.get("duplicate_listings", [])
     if alternatives:

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 
 def health_snapshot(store, data_dir, cycle_max_age_seconds=5400, now=None):
+    from core.llm_health import format_health
     now = now or datetime.now(timezone.utc)
     disk = shutil.disk_usage(data_dir)
     disk_free_percent = round((disk.free / disk.total) * 100, 1) if disk.total else 0.0
@@ -18,6 +19,7 @@ def health_snapshot(store, data_dir, cycle_max_age_seconds=5400, now=None):
         'cycle_age_seconds': None,
         'pending_deliveries': 0,
         'uncertain_attempts': 0,
+        'llm': format_health(store, now),
         'issues': [],
     }
     try:

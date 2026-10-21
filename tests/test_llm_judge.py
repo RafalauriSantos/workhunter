@@ -44,6 +44,24 @@ class TestLlmJudgeUnits:
                 assert mock_gemini.called
                 assert result["cv_compatibility_score"] == 85
 
+    def test_judge_emits_sanitized_provider_health_outcome(self):
+        outcomes = []
+        llm_judge.set_health_observer(lambda provider, model, status:
+                                      outcomes.append((provider, model, status)))
+        fake_response = {
+            "is_real_job_opportunity": True,
+            "cv_compatibility_score": 70,
+        }
+        try:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "secret-test-key"}, clear=True):
+                with patch("core.llm_judge._call_gemini", return_value=fake_response):
+                    result = llm_judge.judge("Dev", "Corp", "Description")
+            assert result["llm_provider"] == "gemini"
+            assert outcomes == [("gemini", "gemini-3.5-flash-lite", "OK")]
+            assert all("secret" not in str(item) for item in outcomes)
+        finally:
+            llm_judge.set_health_observer(None)
+
     def test_judge_handles_api_exception_gracefully(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "fake_gemini_key"}, clear=True):
             with patch("core.llm_judge._call_gemini", side_effect=Exception("API down")):

@@ -152,6 +152,8 @@ def test_run_check_preserves_distinct_linkedin_query_variants(monkeypatch, tmp_p
     config = {
         "min_match_score": 50,
         "heartbeat": {"enabled": False},
+        "linkedin_detail_enrichment_enabled": True,
+        "linkedin_detail_enrichment_limit": 2,
         "monitors": [{
             "type": "linkedin",
             "description": "same monitor description",
@@ -172,6 +174,9 @@ def test_run_check_preserves_distinct_linkedin_query_variants(monkeypatch, tmp_p
     monitor.run_check()
 
     assert [query["query"] for query in captured["searches"]] == ["React Junior", "React Pleno", "Frontend React"]
+    assert all(query["enrich_details"] is True for query in captured["searches"])
+    assert sum(query["detail_enrichment_limit"] for query in captured["searches"]) == 2
+    assert [query["detail_enrichment_limit"] for query in captured["searches"]] == [2, 0, 0]
 
 
 def test_run_check_skips_linkedin_during_persisted_rate_limit(monkeypatch, tmp_path):
@@ -199,6 +204,77 @@ def test_run_check_skips_linkedin_during_persisted_rate_limit(monkeypatch, tmp_p
     monitor.run_check()
 
     assert captured["collector"] == 0
+
+
+def test_detail_http_429_cools_down_details_without_cooling_search(monkeypatch, tmp_path):
+    state_file = tmp_path / "seen.json"
+    config = {
+        "min_match_score": 50,
+        "heartbeat": {"enabled": False},
+        "linkedin_detail_enrichment_enabled": True,
+        "linkedin_detail_enrichment_limit": 1,
+        "monitors": [{"type": "linkedin", "keywords_search": "React"}],
+    }
+
+    class DetailRateLimitedLinkedIn:
+        def __init__(self, *args, **kwargs):
+            self.query_stats = []
+            self.collection_attempts = [{
+                "operation": "detail", "http_status": 429,
+                "result_count": 0, "reason": "HTTP response",
+            }]
+            self.rate_limited = False
+            self.detail_rate_limited = True
+
+        def collect(self):
+            return []
+
+    monkeypatch.setattr(monitor, "load_config", lambda: config)
+    monkeypatch.setattr(monitor, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(monitor, "LinkedInCollector", DetailRateLimitedLinkedIn)
+    monkeypatch.setattr(monitor, "TelegramNotifier", lambda *args, **kwargs: FakeNotifier())
+
+    monitor.run_check()
+
+    saved = StateStore(str(state_file))
+    assert "linkedin" not in saved.state["source_cooldowns"]
+    assert saved.state["source_cooldowns"]["linkedin_detail"]["cooldown_seconds"] == 21600
+
+
+def test_active_linkedin_detail_cooldown_skips_only_detail_requests(monkeypatch, tmp_path):
+    state_file = tmp_path / "seen.json"
+    config = {
+        "min_match_score": 50,
+        "heartbeat": {"enabled": False},
+        "linkedin_detail_enrichment_enabled": True,
+        "linkedin_detail_enrichment_limit": 2,
+        "monitors": [{"type": "linkedin", "keywords_search": "React"}],
+    }
+    store = StateStore(str(state_file))
+    store.register_source_rate_limit("linkedin_detail")
+    captured = {}
+
+    class RecordingLinkedIn:
+        def __init__(self, http, searches):
+            captured["searches"] = searches
+            self.query_stats = []
+            self.collection_attempts = []
+            self.rate_limited = False
+            self.detail_rate_limited = False
+
+        def collect(self):
+            return []
+
+    monkeypatch.setattr(monitor, "load_config", lambda: config)
+    monkeypatch.setattr(monitor, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(monitor, "LinkedInCollector", RecordingLinkedIn)
+    monkeypatch.setattr(monitor, "TelegramNotifier", lambda *args, **kwargs: FakeNotifier())
+
+    monitor.run_check()
+
+    assert len(captured["searches"]) == 1
+    assert captured["searches"][0]["detail_enrichment_limit"] == 0
+    assert "detail_enrichment_skipped_reason" in captured["searches"][0]
 
 
 def test_run_check_never_sends_scope_with_hard_barrier_even_if_score_is_high(monkeypatch, tmp_path):

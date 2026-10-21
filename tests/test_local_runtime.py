@@ -169,6 +169,56 @@ def test_throttled_source_does_not_trigger_failure_alert(tmp_path):
     assert 'linkedin' not in store.state.get('source_alerts', {})
 
 
+def test_operational_alert_uses_recorded_rss_timeout_not_unverified_rate_limit(tmp_path):
+    from core.operational_alerts import update_source_alerts
+    store = SQLiteStore(tmp_path / 'state.db')
+    messages = []
+    sender = lambda message: messages.append(message) or True
+
+    update_source_alerts(store, {'rss': 'PARTIAL'}, sender,
+                         {'rss': {'timeouts': 1, 'http_429': 0}})
+    update_source_alerts(store, {'rss': 'FAILED'}, sender,
+                         {'rss': {'timeouts': 4, 'http_429': 0}})
+
+    assert len(messages) == 1
+    assert 'timeouts: 4' in messages[0]
+    assert 'HTTP 429' not in messages[0]
+
+
+def test_operational_alert_reports_http_429_only_when_attempt_records_it(tmp_path):
+    from core.operational_alerts import update_source_alerts
+    store = SQLiteStore(tmp_path / 'state.db')
+    messages = []
+    sender = lambda message: messages.append(message) or True
+
+    update_source_alerts(store, {'linkedin': 'PARTIAL'}, sender,
+                         {'linkedin': {'http_429': 2}})
+    update_source_alerts(store, {'linkedin': 'PARTIAL'}, sender,
+                         {'linkedin': {'http_429': 1}})
+
+    assert len(messages) == 1
+    assert 'limite 429: 1' in messages[0]
+    assert 'timeouts' not in messages[0]
+
+
+def test_collection_diagnostics_classify_failures_from_attempt_evidence():
+    from core.operational_alerts import summarize_collection_attempts
+
+    summary = summarize_collection_attempts([
+        {'source': 'rss', 'http_status': None, 'error_type': 'Timeout', 'timed_out': True},
+        {'source': 'rss', 'http_status': 429},
+        {'source': 'rss', 'http_status': 503},
+        {'source': 'linkedin', 'http_status': '429'},
+        {'source': 'github', 'http_status': 200},
+    ])
+
+    assert summary == {
+        'rss': {'http_429': 1, 'timeouts': 1, 'other_http_errors': 1, 'other_errors': 0},
+        'linkedin': {'http_429': 1, 'timeouts': 0, 'other_http_errors': 0, 'other_errors': 0},
+        'github': {'http_429': 0, 'timeouts': 0, 'other_http_errors': 0, 'other_errors': 0},
+    }
+
+
 def test_stale_writer_cannot_overwrite(tmp_path):
     first = SQLiteStore(tmp_path / 'state.db')
     second = SQLiteStore(first.filepath)

@@ -33,6 +33,8 @@ def finalize_delivery(
         category=job.compatibility_category,
         potential_score=job.potential_score,
         operational_seniority=job.operational_seniority,
+        score_breakdown=job.score_breakdown,
+        match_reasons=job.match_reasons,
     )
     fingerprint = delivery_fingerprint(job)
     store.record_delivery(fingerprint, source_ids, delivered=sent)

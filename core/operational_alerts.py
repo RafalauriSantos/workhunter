@@ -30,9 +30,10 @@ def send_operational(http, message):
     return False
 
 
-def update_source_alerts(store, statuses, sender):
+def update_source_alerts(store, statuses, sender, diagnostics=None):
     states = store.state.setdefault('source_alerts', {})
     non_failure_statuses = {'THROTTLED', 'COOLDOWN'}
+    diagnostics = diagnostics or {}
     for source, status in statuses.items():
         if status == 'NOT_CONFIGURED' or status in non_failure_statuses:
             continue
@@ -41,17 +42,71 @@ def update_source_alerts(store, statuses, sender):
         if status != 'OK':
             state['failures'] += 1
             if state['failures'] >= 2 and not state['alerted']:
+                summary = format_source_diagnostic(diagnostics.get(source, {}))
+                source_label = {
+                    'gupy': 'Gupy', 'linkedin': 'LinkedIn', 'rss': 'RSS',
+                    'github': 'GitHub', 'trampos': 'Trampos.co',
+                }.get(source, source.capitalize())
                 if status == 'PARTIAL':
-                    message = (
-                        f'Job Finder: {label} degraded in consecutive cycles. '
-                        'Some searches failed or timed out; collected results were preserved '
-                        'and the remaining sources will continue in the next cycle. Check local diagnostics.'
-                    )
+                    message = (f'⚠️ WorkHunter · coleta parcial\n'
+                               f'Fonte: {source_label} · falha em ciclos consecutivos\n'
+                               'Os resultados coletados foram preservados.')
                 else:
-                    message = f'Job Finder: {label} failed in consecutive cycles. Check local diagnostics.'
+                    message = (f'⚠️ WorkHunter · coleta com falha\n'
+                               f'Fonte: {source_label} · falha em ciclos consecutivos')
+                if summary:
+                    message += f'\nDetalhe: {summary}.'
+                message += '\nAção: nova tentativa no próximo ciclo.'
                 state['alerted'] = bool(sender(message))
         else:
             state['failures'] = 0
-            if state['alerted'] and sender(f'Job Finder: {label} recovered; collection is back to normal.'):
+            source_label = {
+                'gupy': 'Gupy', 'linkedin': 'LinkedIn', 'rss': 'RSS',
+                'github': 'GitHub', 'trampos': 'Trampos.co',
+            }.get(source, source.capitalize())
+            message = (f'✅ WorkHunter · coleta normalizada\n'
+                       f'Fonte: {source_label} voltou a responder.')
+            if state['alerted'] and sender(message):
                 state['alerted'] = False
     store.save()
+
+
+def format_source_diagnostic(counts):
+    """Describe only failure classes backed by recorded request attempts."""
+    parts = []
+    if counts.get('http_429'):
+        parts.append(f"limite 429: {int(counts['http_429'])}")
+    if counts.get('timeouts'):
+        parts.append(f"timeouts: {int(counts['timeouts'])}")
+    if counts.get('other_http_errors'):
+        parts.append(f"outros erros HTTP: {int(counts['other_http_errors'])}")
+    if counts.get('other_errors'):
+        parts.append(f"outros erros: {int(counts['other_errors'])}")
+    return ' · '.join(parts)
+
+
+def summarize_collection_attempts(attempts):
+    """Count observed failures by source without inferring causes from status labels."""
+    summary = {}
+    for attempt in attempts:
+        source = str(attempt.get('source') or '')
+        if not source:
+            continue
+        counts = summary.setdefault(source, {
+            'http_429': 0, 'timeouts': 0,
+            'other_http_errors': 0, 'other_errors': 0,
+        })
+        status_code = attempt.get('http_status')
+        try:
+            status_code = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code == 429:
+            counts['http_429'] += 1
+        elif status_code is not None and status_code >= 400:
+            counts['other_http_errors'] += 1
+        elif attempt.get('timed_out'):
+            counts['timeouts'] += 1
+        elif attempt.get('error_type'):
+            counts['other_errors'] += 1
+    return summary

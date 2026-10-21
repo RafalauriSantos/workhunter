@@ -51,6 +51,23 @@ def test_card_shows_profile_gaps_and_semantically_duplicate_postings():
     assert '<a href="https://jobs.example/2">AI Developer - Goiânia</a>' in body
 
 
+def test_card_shows_llm_health_when_attached_to_alert():
+    job = Job(title="Dev", company="Empresa", workplace_type="remote",
+              analysis={"llm_health": "IA: Gemini OK há 2 min"})
+
+    body, _ = build_card(job)
+
+    assert "IA: Gemini OK há 2 min" in body
+
+
+def test_card_only_shows_publication_age_when_timestamp_is_valid_and_past():
+    job = Job(title="Dev", company="Empresa", workplace_type="remote",
+              published_at="2026-10-05T11:57:00+00:00")
+    body, _ = build_card(job)
+    assert "há " in body
+    assert "Fonte:" not in body
+
+
 def test_card_does_not_turn_desirable_english_into_required_caution():
     job = Job(title="Dev", company="Empresa", workplace_type="remote",
               description="Requisitos obrigatórios\nJava\nDiferenciais\nInglês avançado")

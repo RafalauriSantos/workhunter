@@ -61,6 +61,26 @@ def test_collection_attempt_serializes_structured_query(tmp_path):
         assert db.execute('SELECT query FROM collection_attempts').fetchone()[0] == '{"limit": 20, "term": "python"}'
 
 
+def test_latest_collection_attempt_returns_decoded_query_for_rotation(tmp_path):
+    store = SQLiteStore(tmp_path / 'state.db')
+    store.record_collection_attempt({
+        'cycle_id': 'old', 'source': 'linkedin', 'operation': 'search',
+        'query': {'keywords': 'older'}, 'started': '2026-10-17T10:00:00+00:00',
+        'finished': '2026-10-17T10:00:01+00:00',
+    })
+    store.record_collection_attempt({
+        'cycle_id': 'latest', 'source': 'linkedin', 'operation': 'search',
+        'query': {'keywords': 'broad', 'query_id': 'broad-v1'},
+        'started': '2026-10-17T16:00:00+00:00',
+        'finished': '2026-10-17T16:00:01+00:00',
+    })
+
+    latest = store.get_last_collection_attempt('linkedin', 'search')
+
+    assert latest['cycle_id'] == 'latest'
+    assert latest['query'] == {'keywords': 'broad', 'query_id': 'broad-v1'}
+
+
 def test_remember_job_preserves_original_first_seen_timestamp(tmp_path):
     store = SQLiteStore(tmp_path / 'state.db')
     first = Job(title='Junior Developer', company='Acme', workplace_type='remote',

@@ -36,6 +36,64 @@ def rotate_searches(searches: List[Dict[str, Any]], limit: int, slot: int) -> Li
     return ordered[:limit]
 
 
+def rotate_searches_after(searches: List[Dict[str, Any]], limit: int,
+                          last_query: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """Continue after the last query actually attempted by this source.
+
+    Scheduler slots are a poor cursor when a source is polled less often than
+    the main job loop: interval multiples can repeatedly select the same
+    subset. The persisted last query makes rotation independent of wall-clock
+    cadence and configuration ordering when query IDs remain stable.
+    """
+    if limit <= 0 or not searches:
+        return []
+    if not last_query:
+        return list(searches[:limit])
+
+    last_id = str(last_query.get('query_id') or '')
+    last_text = str(last_query.get('keywords') or last_query.get('query') or '').strip().casefold()
+    index = next((i for i, item in enumerate(searches)
+                  if last_id and str(item.get('query_id') or '') == last_id), None)
+    if index is None and last_text:
+        index = next((i for i, item in enumerate(searches)
+                      if str(item.get('query') or item.get('keywords') or '').strip().casefold()
+                      == last_text), None)
+    if index is None:
+        return list(searches[:limit])
+
+    start = (index + 1) % len(searches)
+    ordered = searches[start:] + searches[:start]
+    return ordered[:limit]
+
+
+def select_linkedin_probe(searches: List[Dict[str, Any]],
+                          probe: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """Select one explicitly configured, existing query for a one-shot probe."""
+    if not probe or not probe.get('enabled') or not probe.get('query'):
+        return []
+    requested = ' '.join(str(probe['query']).split()).casefold()
+    selected = next((item for item in searches if
+                     ' '.join(str(item.get('query') or item.get('keywords') or '').split()).casefold()
+                     == requested), None)
+    if not selected:
+        return []
+    result = dict(selected)
+    result['query_id'] = str(probe.get('id') or result.get('query_id') or 'linkedin-probe')
+    return [result]
+
+
+def plan_linkedin_batch(searches: List[Dict[str, Any]], limit: int,
+                        last_query: Dict[str, Any] | None,
+                        probe: Dict[str, Any] | None = None,
+                        probe_consumed: bool = False):
+    """Plan one normal batch, substituting an armed probe exactly once."""
+    if not probe_consumed:
+        selected_probe = select_linkedin_probe(searches, probe)
+        if selected_probe:
+            return selected_probe, str(probe.get('id') or selected_probe[0]['query_id'])
+    return rotate_searches_after(searches, limit, last_query), None
+
+
 def plan_searches(monitors: List[Dict[str, Any]], source_type: str) -> List[Dict[str, Any]]:
     """Gera consultas sem alterar os monitores originais.
 
