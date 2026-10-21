@@ -17,6 +17,7 @@ class LinkedInCollector(BaseCollector):
         self.query_stats: List[Dict[str, Any]] = []
         self.collection_attempts = []
         self.rate_limited = False
+        self.detail_rate_limited = False
 
     def _enrich_job(self, job: Job, headers: Dict[str, str]) -> bool:
         """Tenta obter descrição pública; falhas mantêm o cartão original."""
@@ -25,9 +26,10 @@ class LinkedInCollector(BaseCollector):
             response = self.http.get(job.sources["linkedin"].url, headers=headers, timeout=6)
             if response.status_code != 200:
                 if response.status_code == 429:
-                    self.rate_limited = True
+                    self.detail_rate_limited = True
                 self.record_attempt('linkedin', 'detail', started, query={'job_id': job.sources['linkedin'].source_job_id},
-                                    http_status=response.status_code, error_type=f'HTTP_{response.status_code}')
+                                    http_status=response.status_code, error_type=f'HTTP_{response.status_code}',
+                                    reason='HTTP response')
                 return False
             html = response.text
             description_match = re.search(
@@ -42,6 +44,10 @@ class LinkedInCollector(BaseCollector):
                     re.IGNORECASE,
                 )
             if not description_match:
+                self.record_attempt('linkedin', 'detail', started,
+                                    query={'job_id': job.sources['linkedin'].source_job_id},
+                                    http_status=response.status_code, result_count=0,
+                                    reason='description unavailable')
                 return False
             description = re.sub(r"<[^>]+>", " ", description_match.group(1))
             description = re.sub(r"\s+", " ", unescape(description)).strip()
@@ -51,11 +57,19 @@ class LinkedInCollector(BaseCollector):
                 return False
             job.description = description
             job.technologies = extract_technologies(f"{job.title} {description}")
+            job.workplace_type = normalize_workplace(
+                job.workplace_type,
+                location_text=f"{job.location} {description}",
+                title_text=job.title,
+            )
             job.evidence_level = "MEDIUM_EVIDENCE"
             final_url = getattr(response, "url", "") or ""
             if final_url and final_url != job.sources["linkedin"].url:
                 job.resolved_url = final_url
                 job.canonical_url = sanitize_canonical_url(final_url)
+            self.record_attempt('linkedin', 'detail', started,
+                                query={'job_id': job.sources['linkedin'].source_job_id},
+                                http_status=response.status_code, result_count=1)
             return True
         except Exception as exc:
             self.record_attempt('linkedin', 'detail', locals().get('started', datetime.now(timezone.utc).isoformat()),
@@ -69,7 +83,7 @@ class LinkedInCollector(BaseCollector):
         from core.llm_judge import get_profile
 
         profile = get_profile()
-        title = job.title.lower()
+        title = normalize_title(job.title).lower()
         core = {item.lower() for item in profile.get("stack_core", [])}
         secondary = {item.lower() for item in profile.get("stack_secundaria", [])}
         score = 5 * sum(1 for technology in job.technologies if technology.lower() in core)
@@ -78,9 +92,27 @@ class LinkedInCollector(BaseCollector):
             score += 4
         elif any(word in title for word in ("pleno", "mid-level", "mid level")):
             score += 3
-        elif any(word in title for word in ("senior", "sênior", "lead", "especialista")):
-            score -= 8
+        if re.search(r"\bfull[\s-]?stack\b", title):
+            score += 2
+        if re.search(r"\b(desenvolvedor|developer|programador|software|engenheiro de software|frontend|front-end|backend|back-end)\b", title):
+            score += 1
+        if re.search(r"\b(senior|sênior|lead|staff|principal|especialista|gerente)\b", title):
+            score -= 100
         return score
+
+    @classmethod
+    def _needs_enrichment(cls, job: Job) -> bool:
+        """Limit detail requests to likely software roles with missing evidence."""
+        title = normalize_title(job.title).lower()
+        if re.search(r"\b(senior|sênior|lead|staff|principal|especialista|gerente)\b", title):
+            return False
+        if not re.search(
+            r"\b(desenvolvedor|developer|programador|software|engenheiro de software|full[\s-]?stack|frontend|front-end|backend|back-end)\b",
+            title,
+        ):
+            return False
+        missing_evidence = not bool(job.description.strip()) or job.workplace_type == "unknown"
+        return missing_evidence and cls._enrichment_priority(job) >= 3
 
     def _query_search(self, search_cfg: Dict[str, Any]) -> List[Job]:
         keywords = search_cfg.get("query") or search_cfg.get("keywords", "Desenvolvedor Junior")
@@ -124,8 +156,10 @@ class LinkedInCollector(BaseCollector):
             "cards": 0,
             "parsed_jobs": 0,
             "status": "OK",
+            "enrichment_candidates": 0,
             "enrichment_attempts": 0,
             "enrichment_successes": 0,
+            "enrichment_skipped_reason": search_cfg.get("detail_enrichment_skipped_reason"),
         }
         try:
             for page in range(max_pages):
@@ -151,13 +185,14 @@ class LinkedInCollector(BaseCollector):
                     job_id for card in cards
                     if (job_id := self._extract_job_id(card))
                 ))
+                parsed_page_ids = []
                 audit_query = {**params}
                 if search_cfg.get("query_id"):
                     audit_query["query_id"] = search_cfg["query_id"]
-                self.record_attempt('linkedin', 'search', started, query=audit_query, page=page,
-                                    http_status=resp.status_code, result_count=len(cards), native_ids=page_ids)
                 stats["cards"] += len(cards)
                 if not cards:
+                    self.record_attempt('linkedin', 'search', started, query=audit_query, page=page,
+                                        http_status=resp.status_code, result_count=0, native_ids=[])
                     break
 
                 page_new_jobs = 0
@@ -203,6 +238,7 @@ class LinkedInCollector(BaseCollector):
                             query=audit_query, url=raw_link, published_at=published_at,
                         )
                         continue
+                    parsed_page_ids.append(job_id)
                     if job_id in seen_ids:
                         continue
                     seen_ids.add(job_id)
@@ -223,18 +259,26 @@ class LinkedInCollector(BaseCollector):
                     )
                     job.add_source("linkedin", job_id, raw_link)
                     jobs.append(job)
+                # Use IDs from successfully parsed jobs as a second source of
+                # truth. LinkedIn markup changes can make the card-wide scan
+                # miss IDs even when the dedicated link parser recognizes them.
+                page_ids = list(dict.fromkeys([*page_ids, *parsed_page_ids]))
+                self.record_attempt('linkedin', 'search', started, query=audit_query, page=page,
+                                    http_status=resp.status_code, result_count=len(cards), native_ids=page_ids)
                 if page_new_jobs == 0:
                     break
 
-            # Enrich all cards up to a bounded per-query budget. A limit of one
-            # allowed shallow LinkedIn cards to reach scoring without evidence.
+            # Fetch details only for the relevant shortlist; monitor.py assigns
+            # this query a share of the strict per-cycle detail budget.
             enrichment_limit = max(0, int(search_cfg.get("detail_enrichment_limit", 8)))
             if search_cfg.get("enrich_details", False):
+                eligible = [job for job in jobs if self._needs_enrichment(job)]
                 enrichment_candidates = sorted(
-                    jobs, key=self._enrichment_priority, reverse=True
+                    eligible, key=self._enrichment_priority, reverse=True
                 )[:enrichment_limit]
+                stats["enrichment_candidates"] = len(eligible)
                 for job in enrichment_candidates:
-                    if self.rate_limited:
+                    if self.rate_limited or self.detail_rate_limited:
                         break
                     stats["enrichment_attempts"] += 1
                     if self._enrich_job(job, headers):

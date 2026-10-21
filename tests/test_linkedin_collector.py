@@ -125,6 +125,28 @@ def test_linkedin_search_attempt_recovers_ids_from_job_urls_without_urn(monkeypa
     assert attempt['query']['query_id'] == 'front-end-wide'
 
 
+def test_linkedin_search_attempt_uses_ids_from_parsed_jobs_if_card_scan_misses(monkeypatch):
+    session = requests.Session()
+    monkeypatch.setattr(session, "get", lambda *args, **kwargs: MockResponse(SAMPLE_LINKEDIN_HTML, 200))
+    extract = LinkedInCollector._extract_job_id
+
+    # Reproduce a markup variation where the card-level scan misses identifiers,
+    # but parsing the extracted href still yields valid job IDs.
+    monkeypatch.setattr(
+        LinkedInCollector, "_extract_job_id",
+        staticmethod(lambda card, url="": extract(card, url) if url else ""),
+    )
+    collector = LinkedInCollector(session, [{"query": "developer", "query_id": "probe"}])
+    jobs = collector.collect()
+
+    assert [job.sources["linkedin"].source_job_id for job in jobs] == [
+        "3910293841", "9920192831",
+    ]
+    assert collector.collection_attempts[0]["native_ids"] == [
+        "3910293841", "9920192831",
+    ]
+
+
 def test_linkedin_collector_handles_http_errors_gracefully(monkeypatch):
     session = requests.Session()
     # Simula status 429 Too Many Requests ou 500 do LinkedIn
@@ -157,7 +179,7 @@ def test_linkedin_collector_defers_remaining_searches_after_rate_limit(monkeypat
     assert collector.query_stats[0]["status"] == "HTTP_429"
 
 
-def test_detail_rate_limit_stops_additional_linkedin_requests(monkeypatch):
+def test_detail_rate_limit_pauses_only_enrichment_and_keeps_searches_running(monkeypatch):
     session = requests.Session()
     calls = []
 
@@ -168,19 +190,21 @@ def test_detail_rate_limit_stops_additional_linkedin_requests(monkeypatch):
         return MockResponse("", 429)
 
     monkeypatch.setattr(session, "get", fake_get)
-    collector = LinkedInCollector(session, [{
-        "keywords": "desenvolvedor",
-        "max_pages": 1,
-        "enrich_details": True,
-        "detail_enrichment_limit": 8,
-    }])
+    collector = LinkedInCollector(session, [
+        {"keywords": "desenvolvedor", "max_pages": 1,
+         "enrich_details": True, "detail_enrichment_limit": 8},
+        {"keywords": "frontend", "max_pages": 1,
+         "enrich_details": True, "detail_enrichment_limit": 8},
+    ])
 
     jobs = collector.collect()
 
-    assert len(jobs) == 2
-    assert len(calls) == 2
-    assert collector.rate_limited is True
+    assert len(jobs) == 4
+    assert len(calls) == 3  # search 1, one 429 detail, search 2
+    assert collector.rate_limited is False
+    assert collector.detail_rate_limited is True
     assert collector.query_stats[0]["enrichment_attempts"] == 1
+    assert collector.query_stats[1]["enrichment_attempts"] == 0
 
 
 def test_linkedin_collector_handles_malformed_html(monkeypatch):
@@ -228,7 +252,7 @@ def test_linkedin_collector_preserves_filters_and_paginates(monkeypatch):
 
 def test_linkedin_collector_enriches_detail_description(monkeypatch):
     session = requests.Session()
-    detail_html = '<div class="show-more-less-html__markup">React, Node.js e PostgreSQL para APIs, testes automatizados e integrações.</div>'
+    detail_html = '<div class="show-more-less-html__markup">React, Node.js e PostgreSQL para APIs, testes automatizados e integrações. Trabalho 100% remoto.</div>'
 
     def fake_get(url, **kwargs):
         if "seeMoreJobPostings" in url:
@@ -246,6 +270,7 @@ def test_linkedin_collector_enriches_detail_description(monkeypatch):
     jobs = collector.collect()
 
     assert jobs[0].description.startswith("React, Node.js")
+    assert jobs[0].workplace_type == "remote"
     assert collector.query_stats[0]["enrichment_attempts"] == 1
     assert collector.query_stats[0]["enrichment_successes"] == 1
 
@@ -275,6 +300,62 @@ def test_linkedin_detail_budget_prioritizes_profile_stack_over_first_card(monkey
     assert len(jobs) == 2
     assert len(detail_urls) == 1
     assert detail_urls[0].endswith("react-2")
+
+
+def test_linkedin_enrichment_only_uses_budget_on_relevant_non_senior_cards(monkeypatch):
+    session = requests.Session()
+    cards = '''<ul>
+    <li><div data-entity-urn="urn:li:jobPosting:1"><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/senior-react-1"></a><h3 class="base-search-card__title">Senior React Developer</h3><h4 class="base-search-card__subtitle"><a>Company</a></h4><span class="job-search-card__location">Brasil</span></div></li>
+    <li><div data-entity-urn="urn:li:jobPosting:2"><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/junior-support-2"></a><h3 class="base-search-card__title">Junior Customer Support</h3><h4 class="base-search-card__subtitle"><a>Company</a></h4><span class="job-search-card__location">Brasil</span></div></li>
+    <li><div data-entity-urn="urn:li:jobPosting:3"><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/junior-software-3"></a><h3 class="base-search-card__title">Junior Software Developer</h3><h4 class="base-search-card__subtitle"><a>Company</a></h4><span class="job-search-card__location">Brasil</span></div></li>
+    <li><div data-entity-urn="urn:li:jobPosting:4"><a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/junior-full-stack-4"></a><h3 class="base-search-card__title">Desenvolvedor Junior Full Stack</h3><h4 class="base-search-card__subtitle"><a>Company</a></h4><span class="job-search-card__location">Brasil</span></div></li>
+    </ul>'''
+    detail_urls = []
+
+    def fake_get(url, **kwargs):
+        if "seeMoreJobPostings" in url:
+            return MockResponse(cards, 200)
+        detail_urls.append(url)
+        return MockResponse('<div class="show-more-less-html__markup">React, TypeScript and Node.js are used to build reliable APIs and frontend features.</div>', 200)
+
+    monkeypatch.setattr(session, "get", fake_get)
+    collector = LinkedInCollector(session, [{
+        "keywords": "software", "max_pages": 1,
+        "enrich_details": True, "detail_enrichment_limit": 2,
+    }])
+
+    jobs = collector.collect()
+
+    assert len(jobs) == 4
+    assert [url.rsplit("-", 1)[-1] for url in detail_urls] == ["4", "3"]
+    assert collector.query_stats[0]["enrichment_candidates"] == 2
+    assert collector.query_stats[0]["enrichment_attempts"] == 2
+    assert collector.query_stats[0]["enrichment_successes"] == 2
+    details = [attempt for attempt in collector.collection_attempts if attempt["operation"] == "detail"]
+    assert len(details) == 2
+    assert all(attempt["result_count"] == 1 for attempt in details)
+
+
+def test_linkedin_enrichment_records_detail_fetch_without_description(monkeypatch):
+    session = requests.Session()
+
+    def fake_get(url, **kwargs):
+        if "seeMoreJobPostings" in url:
+            return MockResponse(SAMPLE_LINKEDIN_HTML, 200)
+        return MockResponse('<html><title>Unavailable</title></html>', 200)
+
+    monkeypatch.setattr(session, "get", fake_get)
+    collector = LinkedInCollector(session, [{
+        "keywords": "developer", "max_pages": 1,
+        "enrich_details": True, "detail_enrichment_limit": 1,
+    }])
+
+    collector.collect()
+
+    detail = next(attempt for attempt in collector.collection_attempts if attempt["operation"] == "detail")
+    assert detail["http_status"] == 200
+    assert detail["result_count"] == 0
+    assert detail["reason"] == "description unavailable"
 
 
 def test_linkedin_collector_records_planned_seniority_and_recent_window(monkeypatch):

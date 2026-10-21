@@ -9,8 +9,14 @@
   "linkedin_max_queries": 1,
   "linkedin_max_pages_per_query": 1,
   "linkedin_poll_interval_hours": 6,
-  "linkedin_detail_enrichment_enabled": false,
-  "linkedin_detail_enrichment_limit": 0,
+  "linkedin_poll_times": ["10:00", "22:00"],
+  "linkedin_broad_query_probe": {
+    "enabled": true,
+    "id": "linkedin-profile-broad-v1",
+    "query": "desenvolvedor OR developer OR programador OR software"
+  },
+  "linkedin_detail_enrichment_enabled": true,
+  "linkedin_detail_enrichment_limit": 2,
   "progression_min_score": 45,
   "heartbeat": {
     "enabled": true,

@@ -5,8 +5,13 @@
   "linkedin_max_queries": 1,
   "linkedin_max_pages_per_query": 1,
   "linkedin_poll_interval_hours": 6,
-  "linkedin_detail_enrichment_enabled": false,
-  "linkedin_detail_enrichment_limit": 0,
+  "linkedin_broad_query_probe": {
+    "enabled": false,
+    "id": "linkedin-profile-broad-v1",
+    "query": "desenvolvedor OR developer OR programador OR software"
+  },
+  "linkedin_detail_enrichment_enabled": true,
+  "linkedin_detail_enrichment_limit": 2,
   "monitors": [
     {
       "type": "rss",
